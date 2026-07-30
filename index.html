@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Claude Photo Studio — In-Chat Photo Editor</title>
+  <meta name="description" content="Edit photos by chatting: harmonize collages into one scene, relight, color grade, inpaint and outpaint — powered by Google Gemini image models." />
+  <link rel="preconnect" href="https://generativelanguage.googleapis.com" />
+  <link rel="stylesheet" href="styles.css" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8E%A8%3C/text%3E%3C/svg%3E" />
+</head>
+<body>
+  <!-- ============================ Header ============================ -->
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">🎨</span>
+      <div class="brand-text">
+        <strong>Claude Photo Studio</strong>
+        <span class="brand-sub">In-chat photo editor</span>
+      </div>
+    </div>
+    <div class="topbar-actions">
+      <button id="newSessionBtn" class="btn btn-ghost" title="Start over">↺ New</button>
+      <button id="settingsBtn" class="btn btn-ghost" title="API key & model settings">⚙ Settings</button>
+    </div>
+  </header>
+
+  <!-- ============================ Main layout ============================ -->
+  <main class="workspace">
+    <!-- Canvas / preview side -->
+    <section class="stage" aria-label="Image workspace">
+      <div id="dropZone" class="stage-canvas" tabindex="0">
+        <div id="emptyState" class="empty-state">
+          <div class="empty-icon">🖼️</div>
+          <h2>Drop photos here to begin</h2>
+          <p>Add one image to retouch it, or several to blend into a single scene.</p>
+          <button id="uploadTrigger" class="btn btn-primary">Choose photos</button>
+          <p class="empty-hint">You can also paste an image (⌘/Ctrl&nbsp;+&nbsp;V) or drag &amp; drop.</p>
+        </div>
+        <div id="previewWrap" class="preview-wrap" hidden>
+          <img id="previewImg" class="preview-img" alt="Current edit" />
+          <canvas id="maskCanvas" class="mask-canvas" hidden></canvas>
+          <div id="loadingOverlay" class="loading-overlay" hidden>
+            <div class="spinner"></div>
+            <p id="loadingText">Editing…</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Toolbar under canvas -->
+      <div id="stageToolbar" class="stage-toolbar" hidden>
+        <button id="maskToggle" class="tool-btn" title="Brush over an area to edit only there (inpaint)">🖌️ Mark area</button>
+        <button id="maskClear" class="tool-btn" title="Clear the marked area" hidden>✕ Clear mark</button>
+        <span class="tool-sep"></span>
+        <button id="downloadBtn" class="tool-btn" title="Download current image">⬇ Download</button>
+        <button id="addMoreBtn" class="tool-btn" title="Add another photo">＋ Add photo</button>
+      </div>
+
+      <!-- History strip -->
+      <div id="historyStrip" class="history-strip" hidden>
+        <span class="strip-label">History</span>
+        <div id="historyItems" class="strip-items"></div>
+      </div>
+    </section>
+
+    <!-- Chat side -->
+    <section class="chat" aria-label="Chat">
+      <div id="messages" class="messages">
+        <div class="msg msg-assistant">
+          <div class="msg-avatar">🎨</div>
+          <div class="msg-bubble">
+            <p><strong>Hi! I'm your photo editor.</strong> Tell me what you want in plain language and I'll edit the pixels for you.</p>
+            <p>Try things like:</p>
+            <ul class="msg-examples">
+              <li>“Blend these into one scene with matching light and shadows.”</li>
+              <li>“Relight as warm golden hour.”</li>
+              <li>“Extend the background wider (outpaint).”</li>
+              <li>“Mark an area, then: remove this object.”</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <!-- Included images tray -->
+      <div id="tray" class="tray" hidden>
+        <span class="tray-label">Photos in this edit</span>
+        <div id="trayItems" class="tray-items"></div>
+      </div>
+
+      <!-- Quick actions -->
+      <div class="quick-actions" id="quickActions">
+        <button class="chip" data-prompt="Harmonize all of these photos into one cohesive, realistic scene. Match the lighting direction, shadows, color temperature, and grain so it looks like a single photograph.">✨ Harmonize into one scene</button>
+        <button class="chip" data-prompt="Match the lighting and cast realistic shadows so every element sits naturally in the scene. Keep everything else unchanged.">💡 Match lighting &amp; shadows</button>
+        <button class="chip" data-prompt="Apply a cinematic color grade: rich contrast, teal shadows, warm highlights, filmic tone. Keep it photorealistic.">🎞️ Cinematic color grade</button>
+        <button class="chip" data-prompt="Extend the image outward, generating more of the background naturally beyond the current borders (outpaint). Keep the existing subject untouched.">↔️ Extend / outpaint</button>
+        <button class="chip" data-prompt="Relight this as warm golden-hour sunlight coming from the side, with soft long shadows.">🌅 Golden hour relight</button>
+        <button class="chip" data-prompt="Cleanly remove the marked object and realistically fill in the background behind it.">🧽 Remove object</button>
+      </div>
+
+      <!-- Composer -->
+      <form id="composer" class="composer">
+        <textarea id="prompt" class="composer-input" rows="1" placeholder="Describe the edit you want…" autocomplete="off"></textarea>
+        <button type="submit" id="sendBtn" class="btn btn-primary send-btn" disabled>Edit →</button>
+      </form>
+    </section>
+  </main>
+
+  <!-- ============================ Settings modal ============================ -->
+  <div id="settingsModal" class="modal" hidden>
+    <div class="modal-card">
+      <button class="modal-close" id="settingsClose" aria-label="Close">✕</button>
+      <h2>Settings</h2>
+      <p class="modal-lead">This app talks directly to Google's Gemini image model from your browser. Your key is stored only in this browser (localStorage) and never sent anywhere else.</p>
+
+      <label class="field">
+        <span class="field-label">Google AI Studio API key</span>
+        <input id="apiKeyInput" type="password" class="field-input" placeholder="AIza…" autocomplete="off" spellcheck="false" />
+      </label>
+      <p class="field-help">
+        Free key → open <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a>, sign in with Google, click <em>Create API key</em>, paste it here. No credit card needed.
+      </p>
+
+      <label class="field">
+        <span class="field-label">Model</span>
+        <input id="modelInput" type="text" class="field-input" placeholder="gemini-2.5-flash-image" />
+      </label>
+      <p class="field-help">Default <code>gemini-2.5-flash-image</code> (“nano banana”). If your account can't access it, try <code>gemini-2.0-flash-preview-image-generation</code>.</p>
+
+      <div class="modal-actions">
+        <button id="settingsSave" class="btn btn-primary">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Hidden file input -->
+  <input id="fileInput" type="file" accept="image/*" multiple hidden />
+
+  <!-- Toast -->
+  <div id="toast" class="toast" hidden></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
