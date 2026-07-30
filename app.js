@@ -76,12 +76,26 @@ function cvOf(w, h) { const c = document.createElement("canvas"); c.width = w; c
    Background removal engine (lazy-loaded, cached)
    ============================================================ */
 let _imgly = null;
+/* Browser-bundled builds only — the raw dist/index.mjs has bare imports
+   (zod, ndarray, lodash-es) that don't resolve in a browser. jsDelivr's
+   "/+esm" and esm.sh bundle those dependencies for us. */
+const IMGLY_SOURCES = [
+  "https://cdn.jsdelivr.net/npm/@imgly/background-removal@1.7.0/+esm",
+  "https://esm.sh/@imgly/background-removal@1.7.0",
+  "https://cdn.jsdelivr.net/npm/@imgly/background-removal@1/+esm",
+];
 async function ensureImgly() {
   if (_imgly) return _imgly;
-  const mod = await import("https://cdn.jsdelivr.net/npm/@imgly/background-removal@1/dist/index.mjs");
-  _imgly = mod.removeBackground || mod.default;
-  if (typeof _imgly !== "function") throw new Error("Background-removal module failed to load.");
-  return _imgly;
+  let lastErr;
+  for (const url of IMGLY_SOURCES) {
+    try {
+      const mod = await import(url);
+      const fn = mod.removeBackground || mod.default?.removeBackground || mod.default;
+      if (typeof fn === "function") { _imgly = fn; return _imgly; }
+      lastErr = new Error("Module loaded but removeBackground was not found.");
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error("Could not load the background-removal module.");
 }
 
 /* ============================================================
@@ -144,9 +158,9 @@ async function runCut() {
     dom.cutDownloadBtn.disabled = false;
     toast("Background removed ✓ — add it to your Library.");
   } catch (err) {
-    toast(err?.message?.includes("Failed to fetch") || err?.message?.includes("import")
-      ? "Couldn't load the model (needs a connection the first time)."
-      : (err.message || "Background removal failed."), true);
+    console.error("[cutout] failed:", err);
+    const m = (err && err.message) ? err.message : String(err);
+    toast("Background removal couldn't run: " + m.slice(0, 100), true);
   } finally {
     cutBusy(false);
   }
