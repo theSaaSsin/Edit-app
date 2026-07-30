@@ -181,16 +181,58 @@ function renderLibrary() {
   state.library.forEach((item) => {
     const d = document.createElement("div");
     d.className = "lib-item";
-    d.title = state.tab === "scene" ? "Tap to drop into the scene" : "Switch to Scene tab to use";
-    d.innerHTML = `<img src="${item.dataUrl}" alt="cutout" /><span class="lib-del" data-del="${item.id}">✕</span>`;
-    d.addEventListener("click", (e) => {
-      if (e.target.dataset.del) { state.library = state.library.filter((x) => x.id !== item.id); persistLibrary(); renderLibrary(); return; }
-      if (state.tab !== "scene") { setTab("scene"); toast("Switched to Scene — tap the cutout again to place it."); return; }
-      if (!state.scene.currentId) { toast("Add a scene photo first.", true); return; }
-      addLayerFromAsset(item);
-    });
+    d.dataset.id = item.id;
+    d.title = state.tab === "scene" ? "Tap to place · drag to reorder" : "Drag to reorder · Scene tab to use";
+    d.innerHTML = `<img src="${item.dataUrl}" alt="cutout" draggable="false" /><span class="lib-del" data-del="${item.id}">✕</span>`;
+    d.addEventListener("pointerdown", (e) => startLibPointer(e, item, d));
     dom.libraryItems.appendChild(d);
   });
+}
+
+/* ---- Library: tap-to-place + drag-to-reorder (mouse & touch) ---- */
+let libDrag = null;
+function handleLibTap(item) {
+  if (state.tab !== "scene") { setTab("scene"); toast("Switched to Scene — tap the cutout again to place it."); return; }
+  if (!state.scene.currentId) { toast("Add a scene photo first.", true); return; }
+  addLayerFromAsset(item);
+}
+function startLibPointer(e, item, elem) {
+  if (e.target.dataset.del) {
+    state.library = state.library.filter((x) => x.id !== item.id);
+    persistLibrary(); renderLibrary();
+    return;
+  }
+  libDrag = { item, elem, startX: e.clientX, startY: e.clientY, moved: false };
+  elem.setPointerCapture?.(e.pointerId);
+  window.addEventListener("pointermove", onLibMove);
+  window.addEventListener("pointerup", onLibUp);
+}
+function onLibMove(e) {
+  if (!libDrag) return;
+  if (!libDrag.moved) {
+    if (Math.hypot(e.clientX - libDrag.startX, e.clientY - libDrag.startY) < 6) return;
+    libDrag.moved = true;
+    libDrag.elem.classList.add("dragging");
+  }
+  e.preventDefault();
+  const under = document.elementFromPoint(e.clientX, e.clientY);
+  const target = under && under.closest(".lib-item");
+  if (target && target !== libDrag.elem && target.parentElement === dom.libraryItems) {
+    const rect = target.getBoundingClientRect();
+    const before = e.clientX < rect.left + rect.width / 2;
+    dom.libraryItems.insertBefore(libDrag.elem, before ? target : target.nextSibling);
+  }
+}
+function onLibUp() {
+  window.removeEventListener("pointermove", onLibMove);
+  window.removeEventListener("pointerup", onLibUp);
+  const d = libDrag; libDrag = null;
+  if (!d) return;
+  if (!d.moved) { handleLibTap(d.item); return; }
+  d.elem.classList.remove("dragging");
+  const order = [...dom.libraryItems.querySelectorAll(".lib-item")].map((elm) => elm.dataset.id);
+  state.library.sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));
+  persistLibrary(); renderLibrary();
 }
 
 /* ============================================================
