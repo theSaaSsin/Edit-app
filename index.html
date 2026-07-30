@@ -3,9 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Claude Photo Studio — Cut-Out & Scene Compositor</title>
-  <meta name="description" content="Cut out items onto transparent cutouts, build a library, then drop them into a scene and blend with realistic lighting and shadows — free, powered by Google Gemini." />
-  <link rel="preconnect" href="https://generativelanguage.googleapis.com" />
+  <title>Claude Photo Studio — Free Cut-Out &amp; Scene Compositor</title>
+  <meta name="description" content="Cut out items in your browser (free, no account), build a library, then drop them into a scene with shadows and color grading. 100% client-side." />
   <link rel="stylesheet" href="styles.css" />
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8E%A8%3C/text%3E%3C/svg%3E" />
 </head>
@@ -15,16 +14,15 @@
       <span class="brand-mark">🎨</span>
       <div class="brand-text">
         <strong>Claude Photo Studio</strong>
-        <span class="brand-sub">Cut-out &amp; scene compositor</span>
+        <span class="brand-sub">Free · runs on your device</span>
       </div>
     </div>
     <div class="topbar-actions">
       <button id="newSessionBtn" class="btn btn-ghost" title="Start over">↺ New</button>
-      <button id="settingsBtn" class="btn btn-ghost" title="API key & model settings">⚙ Settings</button>
+      <button id="helpBtn" class="btn btn-ghost" title="How it works">ℹ Help</button>
     </div>
   </header>
 
-  <!-- Workspace tabs -->
   <nav class="tabs">
     <button class="tab active" data-tab="cut">✂️ Cut Out</button>
     <button class="tab" data-tab="scene">🎬 Scene</button>
@@ -38,13 +36,13 @@
         <div id="cutEmpty" class="empty-state">
           <div class="empty-icon">✂️</div>
           <h2>Cut out an item</h2>
-          <p>Add a photo of an outfit piece, furniture, graffiti — anything. I'll isolate it on a transparent background so you can drop it into scenes.</p>
+          <p>Add a photo of an outfit piece, furniture, graffiti — anything with a clear subject. I'll erase the background right here on your device.</p>
           <button id="cutUploadTrigger" class="btn btn-primary">Choose a photo</button>
-          <p class="empty-hint">Then describe what to keep (optional) and tap <strong>Remove background</strong>.</p>
+          <p class="empty-hint">Free &amp; unlimited. Best results: the item is the clear main thing in the photo.</p>
         </div>
         <div id="cutWrap" class="preview-wrap" hidden>
           <img id="cutImg" class="preview-img" alt="Item" />
-          <div id="cutLoading" class="loading-overlay" hidden><div class="spinner"></div><p id="cutLoadingText">Cutting out…</p></div>
+          <div id="cutLoading" class="loading-overlay" hidden><div class="spinner"></div><p id="cutLoadingText">Removing background…</p></div>
         </div>
       </div>
 
@@ -59,20 +57,16 @@
         <div id="sceneWrap" class="preview-wrap" hidden>
           <img id="sceneImg" class="preview-img" alt="Scene" />
           <div id="layerOverlay" class="layer-overlay"></div>
-          <div id="sceneLoading" class="loading-overlay" hidden><div class="spinner"></div><p id="sceneLoadingText">Blending…</p></div>
         </div>
       </div>
 
-      <!-- Toolbar (context per tab) -->
       <div class="stage-toolbar">
-        <!-- Cut toolbar -->
         <div id="cutToolbar" class="toolbar-row">
           <button id="cutAddBtn" class="tool-btn" title="Add / replace the item photo">＋ Photo</button>
           <span class="tool-sep"></span>
           <button id="cutSaveBtn" class="tool-btn" title="Save this cutout to your Library" disabled>💾 Add to Library</button>
           <button id="cutDownloadBtn" class="tool-btn" title="Download cutout PNG" disabled>⬇ PNG</button>
         </div>
-        <!-- Scene toolbar -->
         <div id="sceneToolbar" class="toolbar-row" hidden>
           <button id="sceneAddBtn" class="tool-btn" title="Change scene photo">＋ Scene</button>
           <button id="layerDeleteBtn" class="tool-btn" title="Delete selected item" disabled>🗑 Delete item</button>
@@ -82,7 +76,6 @@
         </div>
       </div>
 
-      <!-- Scene history -->
       <div id="historyStrip" class="history-strip" hidden>
         <span class="strip-label">Scene history</span>
         <div id="historyItems" class="strip-items"></div>
@@ -91,7 +84,6 @@
 
     <!-- ===================== SIDE ===================== -->
     <section class="side">
-      <!-- Shared Library -->
       <div class="library">
         <div class="library-head">
           <span class="strip-label">📚 Library <span id="libCount" class="lib-count">0</span></span>
@@ -100,63 +92,69 @@
         <div id="libraryItems" class="library-items"></div>
       </div>
 
-      <!-- Cut-Out context panel -->
+      <!-- Cut-Out panel -->
       <div id="cutPanel" class="panel">
-        <label class="field">
-          <span class="field-label">What should I keep? <em>(optional)</em></span>
-          <input id="cutPrompt" class="field-input" placeholder="e.g. just the red jacket" autocomplete="off" />
-        </label>
         <button id="cutRunBtn" class="btn btn-primary block" disabled>✂️ Remove background</button>
-        <p class="panel-hint">Leave the box empty to cut out the main subject. Fill it in to grab one specific thing from a busy photo.</p>
-        <div class="quick-actions">
-          <button class="chip" data-cut="Cut out only the clothing / outfit item, on a transparent background.">👕 Just the outfit</button>
-          <button class="chip" data-cut="Cut out only the furniture item, on a transparent background.">🛋️ Just the furniture</button>
-          <button class="chip" data-cut="Cut out only the graffiti / artwork / lettering, on a transparent background, preserving its texture.">🎨 Just the graffiti</button>
-        </div>
+        <p class="panel-hint">Runs a background-removal model right in your browser — free, no account, no limits. The first run downloads the model once (a few MB), then it's cached and works offline.</p>
+        <p class="panel-hint dim">Tip: to isolate one thing (like a jacket), photograph or crop it on its own — free removal keeps the whole foreground subject, it can't pick one object out of a busy photo.</p>
       </div>
 
-      <!-- Scene context panel -->
+      <!-- Scene panel -->
       <div id="scenePanel" class="panel" hidden>
-        <div id="messages" class="messages">
-          <div class="msg msg-assistant">
-            <div class="msg-avatar">🎨</div>
-            <div class="msg-bubble">
-              <p><strong>Scene compositor.</strong> Tap a Library cutout to drop it in, then drag to move, pinch/handle to resize, and rotate. When it's arranged, hit <strong>Blend into scene</strong> and I'll integrate it with real lighting &amp; shadows.</p>
-            </div>
+        <div class="control-block">
+          <label class="switch"><input type="checkbox" id="shadowToggle" checked /><span>Cast shadows under items</span></label>
+          <div class="row">
+            <span class="mini-label">Light from</span>
+            <select id="lightDir" class="mini-select">
+              <option value="tl">↖ Top-left</option>
+              <option value="tr">↗ Top-right</option>
+              <option value="t">↑ Top</option>
+              <option value="bl">↙ Bottom-left</option>
+              <option value="br">↘ Bottom-right</option>
+            </select>
           </div>
         </div>
-        <button id="blendBtn" class="btn btn-primary block" disabled>✨ Blend into scene</button>
-        <div class="quick-actions">
-          <button class="chip" data-scene="Integrate the placed items into the scene photorealistically: match perspective and scale, add realistic contact shadows and cast shadows, match the light direction and color temperature, and color-grade everything to look like one photograph.">✨ Blend naturally</button>
-          <button class="chip" data-scene="Add realistic shadows and reflections beneath and around the added items so they sit convincingly in the scene.">💡 Add shadows</button>
-          <button class="chip" data-scene="Relight the whole scene as warm golden-hour light and unify the color grade.">🌅 Relight scene</button>
-          <button class="chip" data-scene="Fit the added clothing onto the person naturally — correct drape, folds, fit and occlusion — as if they are wearing it.">🧥 Fit outfit to person</button>
+
+        <div class="control-block">
+          <span class="field-label">Color grade <em>(whole scene)</em></span>
+          <div class="quick-actions" id="gradeChips">
+            <button class="chip active" data-grade="none">None</button>
+            <button class="chip" data-grade="warm">🌅 Warm</button>
+            <button class="chip" data-grade="cinematic">🎞️ Cinematic</button>
+            <button class="chip" data-grade="cool">❄️ Cool</button>
+            <button class="chip" data-grade="bw">⚫ B&amp;W</button>
+            <button class="chip" data-grade="vivid">🌈 Vivid</button>
+          </div>
         </div>
-        <form id="composer" class="composer">
-          <textarea id="prompt" class="composer-input" rows="1" placeholder="Or type any scene edit…" autocomplete="off"></textarea>
-          <button type="submit" id="sendBtn" class="btn btn-primary send-btn" disabled>Edit →</button>
-        </form>
+
+        <button id="mergeBtn" class="btn btn-primary block" disabled>🧩 Merge items &amp; bake grade</button>
+
+        <div class="handoff">
+          <p class="handoff-title">✨ Want photorealistic relighting?</p>
+          <p class="handoff-text">Build &amp; arrange here → <strong>Download</strong> → open the free <strong>Gemini app</strong> on your phone, add the image, and paste this:</p>
+          <button id="copyPromptBtn" class="btn btn-ghost block">📋 Copy relight prompt</button>
+          <p class="handoff-note">The Gemini app's image editing is free and separate from the API quota.</p>
+        </div>
+
+        <p class="panel-hint">Tap a Library cutout to place it, then drag to move, use the corner to resize and the top handle to rotate. Merging flattens everything (with shadows &amp; grade) into a new scene version you can keep building on.</p>
+        <div id="statusMsg" class="status"></div>
       </div>
     </section>
   </main>
 
-  <!-- Settings modal -->
-  <div id="settingsModal" class="modal" hidden>
+  <!-- Help modal -->
+  <div id="helpModal" class="modal" hidden>
     <div class="modal-card">
-      <button class="modal-close" id="settingsClose" aria-label="Close">✕</button>
-      <h2>Settings</h2>
-      <p class="modal-lead">Everything is free. This app calls Google's Gemini image model directly from your browser with your own free key, stored only in this browser (localStorage).</p>
-      <label class="field">
-        <span class="field-label">Google AI Studio API key</span>
-        <input id="apiKeyInput" type="password" class="field-input" placeholder="AIza…" autocomplete="off" spellcheck="false" />
-      </label>
-      <p class="field-help">Free key → <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a> → sign in → <em>Create API key</em>. No credit card.</p>
-      <label class="field">
-        <span class="field-label">Model</span>
-        <input id="modelInput" type="text" class="field-input" placeholder="gemini-2.5-flash-image" />
-      </label>
-      <p class="field-help">Default <code>gemini-2.5-flash-image</code>. Fallback: <code>gemini-2.0-flash-preview-image-generation</code>.</p>
-      <div class="modal-actions"><button id="settingsSave" class="btn btn-primary">Save</button></div>
+      <button class="modal-close" id="helpClose" aria-label="Close">✕</button>
+      <h2>How it works</h2>
+      <p class="modal-lead">This app is <strong>completely free</strong> and runs entirely in your browser — there's no account, no API key, and no usage limits.</p>
+      <ul class="help-list">
+        <li><strong>✂️ Cut Out</strong> — pick a photo and tap <em>Remove background</em>. A small AI model runs on your device to erase the background and leave a transparent cutout. Save it to your Library.</li>
+        <li><strong>🎬 Scene</strong> — pick a base image, tap cutouts to drop them in, then move / resize / rotate them. Turn on cast shadows and pick a color grade, then <em>Merge</em> to flatten it into a finished image.</li>
+        <li><strong>📚 Library</strong> — your saved cutouts stay in this browser between visits.</li>
+      </ul>
+      <p class="field-help">First background removal downloads the model once (cached afterward), so it needs a connection that first time. Everything is processed locally — your photos never leave your device.</p>
+      <div class="modal-actions"><button id="helpOk" class="btn btn-primary">Got it</button></div>
     </div>
   </div>
 

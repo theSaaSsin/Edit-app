@@ -110,6 +110,7 @@ body {
   will-change: left, top, width, transform;
 }
 .layer img { display: block; width: 100%; height: auto; pointer-events: none; -webkit-user-drag: none; user-select: none; }
+.layer-overlay.with-shadow .layer img { filter: drop-shadow(var(--sx, 4px) var(--sy, 7px) 7px rgba(0,0,0,.5)); }
 .layer.selected { outline: 2px solid var(--accent); outline-offset: 1px; }
 .layer .handle {
   position: absolute; width: 22px; height: 22px; border-radius: 50%;
@@ -204,8 +205,27 @@ body {
 .msg-thumb { margin-top: 8px; border-radius: 8px; max-width: 150px; max-height: 110px; display: block; border: 1px solid var(--border); }
 .msg-error .msg-bubble { background: #3a1e1e; border-color: #6b2f2f; color: #ffd9d0; }
 
+/* Control blocks (scene) */
+.control-block { margin-bottom: 16px; }
+.switch { display: flex; align-items: center; gap: 9px; font-size: 14px; color: var(--text); cursor: pointer; font-weight: 600; }
+.switch input { width: 17px; height: 17px; accent-color: var(--accent); cursor: pointer; }
+.row { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+.mini-label { font-size: 12.5px; color: var(--text-dim); }
+.mini-select { font: inherit; font-size: 13px; background: var(--bg-elev-2); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 6px 8px; }
+.status { font-size: 12.5px; color: var(--text-faint); margin-top: 10px; min-height: 16px; }
+.status.ok { color: #7fd08a; }
+.status.err { color: #ffb4a8; }
+.panel-hint.dim { opacity: .8; }
+.handoff { border: 1px solid var(--border); background: var(--bg-elev-2); border-radius: 12px; padding: 12px 13px; margin: 14px 0; }
+.handoff-title { margin: 0 0 6px; font-size: 13.5px; font-weight: 700; color: var(--accent-strong); }
+.handoff-text { margin: 0 0 10px; font-size: 12.5px; color: var(--text-dim); line-height: 1.5; }
+.handoff-note { margin: 8px 0 0; font-size: 11.5px; color: var(--text-faint); }
+.help-list { margin: 4px 0 14px; padding-left: 18px; color: var(--text-dim); font-size: 13.5px; line-height: 1.55; }
+.help-list li { margin: 8px 0; }
+
 /* Quick actions */
 .quick-actions { display: flex; gap: 7px; flex-wrap: wrap; margin: 4px 0 12px; }
+.chip.active { background: #241a12; border-color: var(--accent); color: var(--accent-strong); }
 .chip { font: inherit; font-size: 12.5px; font-weight: 500; background: var(--bg-elev-2); border: 1px solid var(--border); color: var(--text-dim); border-radius: 999px; padding: 6px 12px; cursor: pointer; transition: background .15s, color .15s, border-color .15s; white-space: nowrap; }
 .chip:hover { background: #241a12; border-color: var(--accent); color: var(--accent-strong); }
 

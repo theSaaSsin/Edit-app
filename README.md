@@ -1,72 +1,56 @@
-# 🎨 Claude Photo Studio — Cut-Out & Scene Compositor
+# 🎨 Claude Photo Studio — Free Cut-Out & Scene Compositor
 
-Build scenes by cutting out items and blending them together. Two workspaces, one **free** image engine:
+Build scenes from cut-out items — **100% free, runs entirely in your browser.** No account, no API key, no quota. Your photos never leave your device.
 
-- **✂️ Cut Out** — add a photo of an outfit piece, furniture, graffiti — anything — and isolate it onto a **transparent cutout**. Save cutouts to your **Library**.
-- **🎬 Scene** — set a base image (a character, a room, a wall), **tap Library cutouts to drop them in**, then **move / resize / rotate** each one. Hit **Blend** and the model integrates them photorealistically — matching perspective, lighting direction, shadows, and color grade.
+- **✂️ Cut Out** — add a photo of an outfit piece, furniture, graffiti — anything with a clear subject — and an on-device model erases the background, leaving a transparent cutout. Save cutouts to your **Library**.
+- **🎬 Scene** — set a base image (a character, a room, a wall), **tap Library cutouts to drop them in**, then **move / resize / rotate** each one. Turn on **cast shadows** (with adjustable light direction), pick a **color grade**, and **Merge** to flatten it into a finished image with a full undo history.
 
-Also does whole-image edits from plain language (relight, color grade, enhance) and keeps a **scene history** so you can step back to any version.
+## The workflow (free end-to-end)
 
-It runs as a plain static web page — no server, nothing to install. It talks **directly** to Google's Gemini image model from your browser using **your own free API key**, stored only in your browser (`localStorage`).
+This app is deliberately the **front half** of a free pipeline:
 
-> **Cost:** completely free. The only thing it uses is a free **Google AI Studio** API key (no credit card). Both the cut-outs and the scene blending run through that same free key. The free tier has daily rate limits, but it never costs money.
+1. **Cut out & compose here** — precise placement, scaling, rotation, shadows, and grading. (This is exactly what AI image apps are *bad* at.)
+2. **Download** the composite PNG.
+3. Open the **free Gemini app** on your phone (or gemini.google.com), add the image, and paste the built-in **relight prompt** (there's a *Copy relight prompt* button). Nano-banana relights it into one photorealistic scene.
 
-> **A note on "Claude":** Claude (the language model) can *see* and *reason about* images, but it can't render or edit pixels. Generative editing needs a dedicated image model, so this app uses Google **Gemini 2.5 Flash Image** ("nano banana"), which is free and excellent at cut-outs, harmonizing, and relighting.
+> **Why this is free:** the daily quota you can hit is on the *developer API key*. The **Gemini app** has its own separate free image editing — so relighting there doesn't touch that quota. And the cut-out + compositing in this app use **no API at all**; they run locally with the Canvas API and an on-device background-removal model.
 
----
+## Use it on your phone
 
-## Quick start
+Hosted straight from GitHub, nothing to install:
 
-1. **Get a free API key** (no credit card):
-   - Go to **https://aistudio.google.com/apikey** → sign in with Google → **Create API key** → copy it (`AIza…`).
-2. **Open the app** — either the hosted link (see below) or locally:
-   ```bash
-   python3 -m http.server 8000   # then visit http://localhost:8000
-   ```
-3. Click **⚙ Settings**, paste your key, **Save**.
-
-### Use it on your phone (hosted, no setup)
-The app is public and served straight from GitHub:
 **https://raw.githack.com/theSaaSsin/Edit-app/main/index.html**
 
----
-
-## Workflow
+## Workflow details
 
 **Make cutouts (Cut Out tab)**
-1. Tap **Choose a photo** and pick an item.
-2. Optionally type what to keep (e.g. *"just the red jacket"*) — leave empty for the main subject.
-3. Tap **✂️ Remove background** → **💾 Add to Library**. Repeat to build up outfit pieces, furniture, graffiti, etc.
+1. **Choose a photo** with a clear main subject.
+2. Tap **✂️ Remove background** (first run downloads a small model once, then it's cached/offline).
+3. **💾 Add to Library.** Repeat to stock up on garments, furniture, graffiti, etc.
+   *To isolate one thing like a jacket, photograph or crop it on its own — free removal keeps the whole foreground subject and can't pick one object out of a busy photo.*
 
 **Compose a scene (Scene tab)**
-1. Tap **Choose scene photo** (your character / room / wall).
-2. **Tap a Library cutout** to drop it onto the scene.
-3. **Drag** to move, use the **corner handle** to resize, the **top handle** to rotate, the **✕** to delete.
-4. Add more cutouts and arrange them.
-5. Tap **✨ Blend items into scene** — the model fuses everything with realistic shadows, lighting, and color. The result becomes a new scene version (baked in), so you can keep compositing on top of it.
-6. **⬇ Download** saves a PNG.
+1. **Choose scene photo** (character / room / wall).
+2. **Tap a Library cutout** to drop it in.
+3. **Drag** to move · **corner handle** to resize · **top handle** to rotate · **✕** to delete. Add more and arrange.
+4. Toggle **Cast shadows** and set **Light from**; pick a **Color grade**.
+5. **🧩 Merge** to bake shadows + grade into a new scene version (keep compositing on top), or **⬇ Download** any time.
+6. For photorealism, hand the download to the **Gemini app** with the copied relight prompt.
 
-**Tips**
-- *Build an outfit on a character:* cut out each garment, drop them on the person, then use **🧥 Fit outfit to person**.
-- *Add furniture/graffiti:* place them, then **💡 Add shadows** and **✨ Blend naturally**.
-- Your **Library persists** in the browser between sessions; **New** clears the current scene/cutout but keeps the Library.
-
----
+Your **Library persists** in the browser between visits. **New** clears the current scene/cut-out but keeps the Library.
 
 ## Files
 
 ```
-index.html   — layout: tabs, cut-out & scene stages, library, panels
-styles.css   — dark responsive UI, transparency checkerboard, layer handles
-app.js       — tabs, cut-out, library, scene layers (drag/resize/rotate),
-               flatten + blend, scene history, Gemini calls
+index.html   — tabs, cut-out & scene stages, library, panels, help
+styles.css   — dark responsive UI, transparency checkerboard, layer handles, shadow preview
+app.js       — on-device background removal (@imgly/background-removal),
+               library, scene layers (drag/resize/rotate), canvas shadows,
+               color grades, flatten/merge, history, relight-prompt handoff
 ```
 
-No build step, no dependencies.
+No build step. The only runtime dependency is the background-removal model, loaded on demand from a public CDN and cached.
 
----
+## Privacy
 
-## Configuration & privacy
-
-- **Model** is configurable in Settings. Default `gemini-2.5-flash-image`; fallback `gemini-2.0-flash-preview-image-generation`.
-- Your API key never leaves your browser except in requests **to Google's API**. Images are sent to Gemini to perform the edits — that's where the work happens. There is no backend of our own.
+Everything is processed locally in your browser. No server, no uploads. The background-removal model is downloaded once (then cached); after that the app works offline.
