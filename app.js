@@ -1,72 +1,56 @@
 /* ============================================================
-   Claude Photo Studio — in-chat photo editor
-   Talks directly to Google's Gemini image model from the browser.
-   No backend; the API key lives only in localStorage.
+   Claude Photo Studio — cut-out & scene compositor
+   Two workspaces sharing one free Gemini backend:
+     • Cut Out — isolate an item onto a transparent cutout → Library
+     • Scene   — drop cutouts onto a base image, arrange, then blend
+   All calls go to Google Gemini from the browser with the user's own
+   free key (localStorage). No backend, no cost.
    ============================================================ */
 "use strict";
 
-/* ---------------------------------------------------------------
-   State
---------------------------------------------------------------- */
-const state = {
-  /** Source photos the user uploaded: {id, name, dataUrl, on} */
-  sources: [],
-  /** Edit results over time: {id, dataUrl, prompt} — index 0..n */
-  versions: [],
-  currentVersionId: null,
-  busy: false,
-  masking: false,
-};
-
+/* ---------------- Settings ---------------- */
 const settings = {
   apiKey: localStorage.getItem("cps_apiKey") || "",
   model: localStorage.getItem("cps_model") || "gemini-2.5-flash-image",
 };
 
-let idSeq = 0;
-const uid = (p) => `${p}_${Date.now().toString(36)}_${idSeq++}`;
-
-/* ---------------------------------------------------------------
-   Element refs
---------------------------------------------------------------- */
-const el = (id) => document.getElementById(id);
-const dom = {
-  dropZone: el("dropZone"),
-  emptyState: el("emptyState"),
-  previewWrap: el("previewWrap"),
-  previewImg: el("previewImg"),
-  maskCanvas: el("maskCanvas"),
-  loadingOverlay: el("loadingOverlay"),
-  loadingText: el("loadingText"),
-  stageToolbar: el("stageToolbar"),
-  maskToggle: el("maskToggle"),
-  maskClear: el("maskClear"),
-  downloadBtn: el("downloadBtn"),
-  addMoreBtn: el("addMoreBtn"),
-  historyStrip: el("historyStrip"),
-  historyItems: el("historyItems"),
-  messages: el("messages"),
-  tray: el("tray"),
-  trayItems: el("trayItems"),
-  composer: el("composer"),
-  prompt: el("prompt"),
-  sendBtn: el("sendBtn"),
-  fileInput: el("fileInput"),
-  uploadTrigger: el("uploadTrigger"),
-  newSessionBtn: el("newSessionBtn"),
-  settingsBtn: el("settingsBtn"),
-  settingsModal: el("settingsModal"),
-  settingsClose: el("settingsClose"),
-  settingsSave: el("settingsSave"),
-  apiKeyInput: el("apiKeyInput"),
-  modelInput: el("modelInput"),
-  toast: el("toast"),
-  quickActions: el("quickActions"),
+/* ---------------- State ---------------- */
+const state = {
+  tab: "cut",
+  library: [],                 // [{id, dataUrl}]
+  cut: { src: null, result: null, busy: false },
+  scene: {
+    versions: [],              // [{id, dataUrl}] base-scene history
+    currentId: null,
+    layers: [],                // placed cutouts
+    selectedId: null,
+    busy: false,
+    zTop: 1,
+  },
 };
 
-/* ---------------------------------------------------------------
-   Helpers
---------------------------------------------------------------- */
+let idSeq = 0;
+const uid = (p) => `${p}_${Date.now().toString(36)}_${idSeq++}`;
+let uploadTarget = "cut";
+
+/* ---------------- DOM ---------------- */
+const el = (id) => document.getElementById(id);
+const dom = {};
+[
+  "cutStage","cutEmpty","cutWrap","cutImg","cutLoading","cutLoadingText",
+  "sceneStage","sceneEmpty","sceneWrap","sceneImg","layerOverlay","sceneLoading","sceneLoadingText",
+  "cutToolbar","cutAddBtn","cutSaveBtn","cutDownloadBtn",
+  "sceneToolbar","sceneAddBtn","layerDeleteBtn","layerFlattenReset","sceneDownloadBtn",
+  "historyStrip","historyItems",
+  "libraryItems","libCount","libHint",
+  "cutPanel","cutPrompt","cutRunBtn",
+  "scenePanel","messages","blendBtn","composer","prompt","sendBtn",
+  "fileInput","cutUploadTrigger","sceneUploadTrigger",
+  "newSessionBtn","settingsBtn","settingsModal","settingsClose","settingsSave","apiKeyInput","modelInput",
+  "toast",
+].forEach((id) => (dom[id] = el(id)));
+
+/* ---------------- Helpers ---------------- */
 function toast(msg, isErr = false) {
   dom.toast.textContent = msg;
   dom.toast.classList.toggle("err", isErr);
@@ -74,237 +58,39 @@ function toast(msg, isErr = false) {
   clearTimeout(toast._t);
   toast._t = setTimeout(() => (dom.toast.hidden = true), isErr ? 5200 : 3000);
 }
-
-/** Read a File into a data URL. */
 function fileToDataUrl(file) {
-  return new Promise((resolve, reject) => {
+  return new Promise((res, rej) => {
     const r = new FileReader();
-    r.onload = () => resolve(r.result);
-    r.onerror = reject;
+    r.onload = () => res(r.result);
+    r.onerror = rej;
     r.readAsDataURL(file);
   });
 }
-
-/** Split a data URL into {mimeType, data(base64)}. */
+function loadImage(src) {
+  return new Promise((res, rej) => {
+    const im = new Image();
+    im.onload = () => res(im);
+    im.onerror = rej;
+    im.src = src;
+  });
+}
 function splitDataUrl(dataUrl) {
   const m = /^data:([^;]+);base64,(.*)$/.exec(dataUrl);
   if (!m) throw new Error("Unsupported image encoding");
   return { mimeType: m[1], data: m[2] };
 }
-
-/** The image currently shown in the big preview (latest/selected result, else first active source). */
-function currentImageDataUrl() {
-  const v = state.versions.find((x) => x.id === state.currentVersionId);
-  if (v) return v.dataUrl;
-  const s = state.sources.find((x) => x.on) || state.sources[0];
-  return s ? s.dataUrl : null;
-}
-
-/* ---------------------------------------------------------------
-   Rendering
---------------------------------------------------------------- */
-function render() {
-  const hasImages = state.sources.length > 0 || state.versions.length > 0;
-
-  dom.emptyState.hidden = hasImages;
-  dom.previewWrap.hidden = !hasImages;
-  dom.stageToolbar.hidden = !hasImages;
-
-  const cur = currentImageDataUrl();
-  if (cur) dom.previewImg.src = cur;
-
-  renderTray();
-  renderHistory();
-  updateSendState();
-}
-
-function renderTray() {
-  dom.tray.hidden = state.sources.length === 0;
-  dom.trayItems.innerHTML = "";
-  state.sources.forEach((s, i) => {
-    const chip = document.createElement("div");
-    chip.className = `tray-chip ${s.on ? "on" : "off"}`;
-    chip.title = s.on ? "Included in the next edit — click to exclude" : "Excluded — click to include";
-    chip.innerHTML = `
-      <img src="${s.dataUrl}" alt="${s.name}" />
-      <span class="tray-check">✓</span>
-      <span class="tray-remove" data-remove="${s.id}" title="Remove photo">✕</span>`;
-    chip.addEventListener("click", (e) => {
-      if (e.target.dataset.remove) {
-        state.sources = state.sources.filter((x) => x.id !== s.id);
-        render();
-        return;
-      }
-      s.on = !s.on;
-      render();
-    });
-    dom.trayItems.appendChild(chip);
-  });
-}
-
-function renderHistory() {
-  dom.historyStrip.hidden = state.versions.length === 0;
-  dom.historyItems.innerHTML = "";
-  state.versions.forEach((v, i) => {
-    const t = document.createElement("div");
-    t.className = `thumb ${v.id === state.currentVersionId ? "active" : ""}`;
-    t.title = v.prompt || `Version ${i + 1}`;
-    t.innerHTML = `<img src="${v.dataUrl}" alt="v${i + 1}" /><span class="thumb-badge">v${i + 1}</span>`;
-    t.addEventListener("click", () => {
-      state.currentVersionId = v.id;
-      render();
-    });
-    dom.historyItems.appendChild(t);
-  });
-}
-
-function updateSendState() {
-  const ready =
-    !state.busy &&
-    !!settings.apiKey &&
-    (state.sources.length > 0 || state.versions.length > 0) &&
-    dom.prompt.value.trim().length > 0;
-  dom.sendBtn.disabled = !ready;
-}
-
-/* ---------------------------------------------------------------
-   Chat log
---------------------------------------------------------------- */
-function addMessage(role, html, { thumbUrl = null, isError = false } = {}) {
-  const wrap = document.createElement("div");
-  wrap.className = `msg msg-${role}` + (isError ? " msg-error" : "");
-  const avatar = role === "user" ? "🧑" : "🎨";
-  wrap.innerHTML = `
-    <div class="msg-avatar">${avatar}</div>
-    <div class="msg-bubble">${html}${thumbUrl ? `<img class="msg-thumb" src="${thumbUrl}" alt="attached" />` : ""}</div>`;
-  dom.messages.appendChild(wrap);
-  dom.messages.scrollTop = dom.messages.scrollHeight;
-  return wrap;
-}
-
 function escapeHtml(s) {
-  return s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 }
 
-/* ---------------------------------------------------------------
-   Adding images
---------------------------------------------------------------- */
-async function addFiles(fileList) {
-  const files = [...fileList].filter((f) => f.type.startsWith("image/"));
-  if (!files.length) return;
-  for (const f of files) {
-    try {
-      const dataUrl = await fileToDataUrl(f);
-      state.sources.push({ id: uid("src"), name: f.name || "photo", dataUrl, on: true });
-    } catch {
-      toast(`Couldn't read ${f.name}`, true);
-    }
-  }
-  // Before any edit, preview the newest source.
-  if (!state.currentVersionId) state.currentVersionId = null;
-  render();
-}
-
-/* ---------------------------------------------------------------
-   Mask / brush (inpaint helper)
---------------------------------------------------------------- */
-const mask = {
-  ctx: null,
-  drawing: false,
-  hasStrokes: false,
-  brush: 34,
-};
-
-function setupMaskCanvas() {
-  const c = dom.maskCanvas;
-  // Match canvas pixel size to the *displayed* image size.
-  const rect = dom.previewImg.getBoundingClientRect();
-  const wrapRect = dom.previewWrap.getBoundingClientRect();
-  c.width = rect.width;
-  c.height = rect.height;
-  c.style.width = rect.width + "px";
-  c.style.height = rect.height + "px";
-  c.style.left = rect.left - wrapRect.left + "px";
-  c.style.top = rect.top - wrapRect.top + "px";
-  c.style.position = "absolute";
-  mask.ctx = c.getContext("2d");
-  mask.ctx.strokeStyle = "rgba(255, 0, 200, 0.55)";
-  mask.ctx.lineWidth = mask.brush;
-  mask.ctx.lineCap = "round";
-  mask.ctx.lineJoin = "round";
-  mask.hasStrokes = false;
-}
-
-function maskPos(e) {
-  const r = dom.maskCanvas.getBoundingClientRect();
-  const p = e.touches ? e.touches[0] : e;
-  return { x: p.clientX - r.left, y: p.clientY - r.top };
-}
-function maskDown(e) {
-  if (!state.masking) return;
-  e.preventDefault();
-  mask.drawing = true;
-  const { x, y } = maskPos(e);
-  mask.ctx.beginPath();
-  mask.ctx.moveTo(x, y);
-}
-function maskMove(e) {
-  if (!mask.drawing) return;
-  e.preventDefault();
-  const { x, y } = maskPos(e);
-  mask.ctx.lineTo(x, y);
-  mask.ctx.stroke();
-  mask.hasStrokes = true;
-}
-function maskUp() {
-  mask.drawing = false;
-  dom.maskClear.hidden = !mask.hasStrokes;
-}
-
-function toggleMask() {
-  if (!currentImageDataUrl()) return;
-  state.masking = !state.masking;
-  dom.maskToggle.classList.toggle("active", state.masking);
-  dom.maskCanvas.hidden = !state.masking;
-  if (state.masking) {
-    setupMaskCanvas();
-    toast("Brush over the area you want to change, then describe the edit.");
-  }
-}
-function clearMask() {
-  if (mask.ctx) mask.ctx.clearRect(0, 0, dom.maskCanvas.width, dom.maskCanvas.height);
-  mask.hasStrokes = false;
-  dom.maskClear.hidden = true;
-}
-
-/**
- * Produce a version of the current image with the brushed area burned in,
- * so the model knows exactly where to work. Returns a data URL, or null.
- */
-function buildMaskedImage() {
-  if (!state.masking || !mask.hasStrokes) return null;
-  const img = dom.previewImg;
-  const out = document.createElement("canvas");
-  out.width = img.naturalWidth;
-  out.height = img.naturalHeight;
-  const ctx = out.getContext("2d");
-  ctx.drawImage(img, 0, 0, out.width, out.height);
-  // Scale the (displayed-size) mask strokes up to natural size.
-  ctx.drawImage(dom.maskCanvas, 0, 0, out.width, out.height);
-  return out.toDataURL("image/png");
-}
-
-/* ---------------------------------------------------------------
-   Gemini call
---------------------------------------------------------------- */
+/* ---------------- Gemini ---------------- */
 async function callGemini(promptText, images) {
+  if (!settings.apiKey) throw new Error("Add your free Google AI Studio key in Settings first.");
   const parts = [{ text: promptText }];
   for (const dataUrl of images) parts.push({ inlineData: splitDataUrl(dataUrl) });
-
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
     settings.model
   )}:generateContent?key=${encodeURIComponent(settings.apiKey)}`;
-
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -313,292 +99,550 @@ async function callGemini(promptText, images) {
       generationConfig: { responseModalities: ["IMAGE", "TEXT"] },
     }),
   });
-
   const json = await res.json().catch(() => ({}));
-
-  if (!res.ok) {
-    const msg = json?.error?.message || `Request failed (${res.status})`;
-    throw new Error(msg);
-  }
-
-  const candidate = json?.candidates?.[0];
-  if (!candidate) {
+  if (!res.ok) throw new Error(json?.error?.message || `Request failed (${res.status})`);
+  const cand = json?.candidates?.[0];
+  if (!cand) {
     const fb = json?.promptFeedback?.blockReason;
     throw new Error(fb ? `Blocked by safety filter (${fb}).` : "No result returned.");
   }
-
-  let imageOut = null;
-  let textOut = "";
-  for (const p of candidate.content?.parts || []) {
-    if (p.inlineData?.data) {
-      imageOut = `data:${p.inlineData.mimeType || "image/png"};base64,${p.inlineData.data}`;
-    } else if (p.text) {
-      textOut += p.text;
-    }
+  let imageOut = null, textOut = "";
+  for (const p of cand.content?.parts || []) {
+    if (p.inlineData?.data) imageOut = `data:${p.inlineData.mimeType || "image/png"};base64,${p.inlineData.data}`;
+    else if (p.text) textOut += p.text;
   }
   return { imageOut, textOut };
 }
 
-/* ---------------------------------------------------------------
-   Submit an edit
---------------------------------------------------------------- */
-async function submitEdit(rawPrompt) {
-  const promptText = rawPrompt.trim();
-  if (!promptText) return;
+/* ============================================================
+   TABS
+   ============================================================ */
+function setTab(tab) {
+  state.tab = tab;
+  document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === tab));
+  const isCut = tab === "cut";
+  dom.cutStage.hidden = !isCut;
+  dom.sceneStage.hidden = isCut;
+  dom.cutToolbar.hidden = !isCut;
+  dom.sceneToolbar.hidden = isCut;
+  dom.cutPanel.hidden = !isCut;
+  dom.scenePanel.hidden = isCut;
+  dom.historyStrip.hidden = isCut || state.scene.versions.length === 0;
+  if (!isCut) requestAnimationFrame(positionOverlay);
+}
 
-  if (!settings.apiKey) {
-    openSettings();
-    toast("Add your free Google AI Studio key to start.", true);
-    return;
-  }
-  if (state.sources.length === 0 && state.versions.length === 0) {
-    toast("Add at least one photo first.", true);
-    return;
-  }
-
-  // Gather images to send.
-  const images = [];
-  const maskedUrl = buildMaskedImage();
-  let effectivePrompt = promptText;
-
-  if (maskedUrl) {
-    // Inpaint mode: send the marked-up image and tell the model where to work.
-    images.push(maskedUrl);
-    effectivePrompt =
-      `The magenta highlighted region marks where to apply this change: "${promptText}". ` +
-      `Blend the edit seamlessly with matching lighting, shadow and color. ` +
-      `Do NOT alter anything outside the highlighted region, and do NOT include the magenta overlay in the output.`;
-  } else {
-    // Normal mode: current result (if any) + every "on" source.
-    const cur = state.versions.find((x) => x.id === state.currentVersionId);
-    if (cur) images.push(cur.dataUrl);
-    for (const s of state.sources) if (s.on) images.push(s.dataUrl);
-    // De-dup while preserving order.
-    const seen = new Set();
-    for (let i = images.length - 1; i >= 0; i--) {
-      if (seen.has(images[i])) images.splice(i, 1);
-      else seen.add(images[i]);
-    }
-  }
-
-  if (images.length === 0) {
-    toast("No photos selected for this edit.", true);
-    return;
-  }
-
-  // UI: user message + busy state.
-  addMessage("user", `<p>${escapeHtml(promptText)}</p>`);
-  dom.prompt.value = "";
-  autoGrow();
-  setBusy(true, images.length > 1 ? "Blending scene…" : "Editing…");
-
+/* ============================================================
+   CUT-OUT WORKSPACE
+   ============================================================ */
+async function cutSetSource(file) {
   try {
-    const { imageOut, textOut } = await callGemini(effectivePrompt, images);
+    const dataUrl = await fileToDataUrl(file);
+    state.cut.src = dataUrl;
+    state.cut.result = null;
+    dom.cutImg.src = dataUrl;
+    dom.cutEmpty.hidden = true;
+    dom.cutWrap.hidden = false;
+    dom.cutRunBtn.disabled = false;
+    dom.cutSaveBtn.disabled = true;
+    dom.cutDownloadBtn.disabled = true;
+  } catch {
+    toast("Couldn't read that image.", true);
+  }
+}
 
+async function runCut() {
+  if (!state.cut.src || state.cut.busy) return;
+  const want = dom.cutPrompt.value.trim();
+  const subject = want || "the main subject";
+  const prompt =
+    `Cut out ${subject} from this image. Remove the background completely and return ONLY ${subject} ` +
+    `as a PNG with a fully transparent background (real alpha channel). Do not add any new background, ` +
+    `canvas, drop shadow, outline or border. Keep the subject's original detail, edges and colors.`;
+  cutBusy(true);
+  try {
+    const { imageOut, textOut } = await callGemini(prompt, [state.cut.src]);
     if (!imageOut) {
-      addMessage(
-        "assistant",
-        `<p>${textOut ? escapeHtml(textOut) : "The model didn't return an image. Try rephrasing, or check the model name in Settings."}</p>`,
-        { isError: !textOut }
-      );
+      toast(textOut ? textOut.slice(0, 120) : "No cutout returned — try rephrasing.", true);
       return;
     }
-
-    // New version.
-    const v = { id: uid("v"), dataUrl: imageOut, prompt: promptText };
-    state.versions.push(v);
-    state.currentVersionId = v.id;
-
-    // After the first successful edit, keep iterating on the result:
-    // turn sources off so follow-ups operate on the latest version.
-    if (state.versions.length === 1) state.sources.forEach((s) => (s.on = false));
-
-    // Clear any mask.
-    if (state.masking) toggleMask();
-    clearMask();
-
-    addMessage(
-      "assistant",
-      `<p>${textOut ? escapeHtml(textOut) : "Done — here's the edit."}</p>`,
-      { thumbUrl: imageOut }
-    );
+    state.cut.result = imageOut;
+    dom.cutImg.src = imageOut;
+    dom.cutSaveBtn.disabled = false;
+    dom.cutDownloadBtn.disabled = false;
+    toast("Cutout ready — add it to your Library.");
   } catch (err) {
-    addMessage("assistant", `<p>⚠️ ${escapeHtml(err.message || "Something went wrong.")}</p>`, {
-      isError: true,
-    });
-    toast(err.message || "Edit failed", true);
+    toast(err.message || "Cut-out failed", true);
   } finally {
-    setBusy(false);
-    render();
+    cutBusy(false);
+  }
+}
+function cutBusy(b) {
+  state.cut.busy = b;
+  dom.cutLoading.hidden = !b;
+  dom.cutRunBtn.disabled = b || !state.cut.src;
+}
+
+function saveCutToLibrary() {
+  const url = state.cut.result;
+  if (!url) return;
+  state.library.push({ id: uid("lib"), dataUrl: url });
+  persistLibrary();
+  renderLibrary();
+  toast("Saved to Library ✓");
+}
+
+/* ============================================================
+   LIBRARY
+   ============================================================ */
+function persistLibrary() {
+  try {
+    localStorage.setItem("cps_library", JSON.stringify(state.library));
+  } catch {
+    /* quota — keep in memory only for this session */
+  }
+}
+function loadLibrary() {
+  try {
+    const raw = localStorage.getItem("cps_library");
+    if (raw) state.library = JSON.parse(raw) || [];
+  } catch {
+    state.library = [];
+  }
+}
+function renderLibrary() {
+  dom.libCount.textContent = state.library.length;
+  dom.libHint.hidden = state.library.length > 0;
+  dom.libraryItems.innerHTML = "";
+  if (!state.library.length) {
+    const p = document.createElement("div");
+    p.className = "lib-empty";
+    p.textContent = "No cutouts yet. Make one in the Cut Out tab.";
+    dom.libraryItems.appendChild(p);
+    return;
+  }
+  state.library.forEach((item) => {
+    const d = document.createElement("div");
+    d.className = "lib-item";
+    d.title = state.tab === "scene" ? "Tap to drop into the scene" : "Switch to Scene tab to use";
+    d.innerHTML = `<img src="${item.dataUrl}" alt="cutout" /><span class="lib-del" data-del="${item.id}">✕</span>`;
+    d.addEventListener("click", (e) => {
+      if (e.target.dataset.del) {
+        state.library = state.library.filter((x) => x.id !== item.id);
+        persistLibrary();
+        renderLibrary();
+        return;
+      }
+      if (state.tab !== "scene") {
+        setTab("scene");
+        toast("Switched to Scene — tap the cutout again to place it.");
+        return;
+      }
+      if (!state.scene.currentId) {
+        toast("Add a scene photo first.", true);
+        return;
+      }
+      addLayerFromAsset(item);
+    });
+    dom.libraryItems.appendChild(d);
+  });
+}
+
+/* ============================================================
+   SCENE WORKSPACE
+   ============================================================ */
+async function sceneSetBase(file) {
+  try {
+    const dataUrl = await fileToDataUrl(file);
+    pushSceneVersion(dataUrl);
+    state.scene.layers = [];
+    state.scene.selectedId = null;
+    dom.sceneEmpty.hidden = true;
+    dom.sceneWrap.hidden = false;
+    await showScene(dataUrl);
+    renderLayers();
+    updateSceneButtons();
+  } catch {
+    toast("Couldn't read that image.", true);
+  }
+}
+function pushSceneVersion(dataUrl) {
+  const v = { id: uid("sv"), dataUrl };
+  state.scene.versions.push(v);
+  state.scene.currentId = v.id;
+  renderHistory();
+}
+async function showScene(dataUrl) {
+  await new Promise((res) => {
+    dom.sceneImg.onload = () => res();
+    dom.sceneImg.src = dataUrl;
+  });
+  positionOverlay();
+}
+
+function currentSceneUrl() {
+  const v = state.scene.versions.find((x) => x.id === state.scene.currentId);
+  return v ? v.dataUrl : null;
+}
+
+/* ---- Layer overlay geometry ---- */
+function positionOverlay() {
+  if (dom.sceneWrap.hidden) return;
+  const img = dom.sceneImg;
+  if (!img.naturalWidth) return;
+  const wrap = dom.sceneWrap.getBoundingClientRect();
+  const r = img.getBoundingClientRect();
+  const ov = dom.layerOverlay;
+  ov.style.left = r.left - wrap.left + "px";
+  ov.style.top = r.top - wrap.top + "px";
+  ov.style.width = r.width + "px";
+  ov.style.height = r.height + "px";
+  renderLayers();
+}
+
+function addLayerFromAsset(asset) {
+  loadImage(asset.dataUrl).then((im) => {
+    const layer = {
+      id: uid("ly"),
+      dataUrl: asset.dataUrl,
+      img: im,
+      imgW: im.naturalWidth,
+      imgH: im.naturalHeight,
+      fx: 0.5, fy: 0.5,     // center as fraction of scene
+      fw: 0.4,              // width as fraction of scene width
+      rot: 0,
+      z: ++state.scene.zTop,
+    };
+    state.scene.layers.push(layer);
+    state.scene.selectedId = layer.id;
+    renderLayers();
+    updateSceneButtons();
+  });
+}
+
+function renderLayers() {
+  const ov = dom.layerOverlay;
+  const ow = ov.clientWidth, oh = ov.clientHeight;
+  ov.innerHTML = "";
+  const sorted = [...state.scene.layers].sort((a, b) => a.z - b.z);
+  for (const L of sorted) {
+    const wpx = L.fw * ow;
+    const div = document.createElement("div");
+    div.className = "layer" + (L.id === state.scene.selectedId ? " selected" : "");
+    div.style.left = L.fx * ow + "px";
+    div.style.top = L.fy * oh + "px";
+    div.style.width = wpx + "px";
+    div.style.setProperty("--rot", L.rot + "deg");
+    div.dataset.id = L.id;
+    div.innerHTML =
+      `<img src="${L.dataUrl}" alt="item" />` +
+      `<span class="handle h-del" data-role="del" title="Delete">✕</span>` +
+      `<span class="handle h-rotate" data-role="rotate" title="Rotate">⟳</span>` +
+      `<span class="handle h-resize" data-role="resize" title="Resize">⤡</span>`;
+    div.addEventListener("pointerdown", (e) => startLayerPointer(e, L));
+    ov.appendChild(div);
   }
 }
 
-function setBusy(b, text = "Editing…") {
-  state.busy = b;
-  dom.loadingOverlay.hidden = !b;
-  dom.loadingText.textContent = text;
-  updateSendState();
+/* ---- Pointer interaction (move / resize / rotate) ---- */
+let drag = null;
+function startLayerPointer(e, L) {
+  e.preventDefault();
+  e.stopPropagation();
+  state.scene.selectedId = L.id;
+  L.z = ++state.scene.zTop;
+  const role = e.target.dataset.role || "move";
+  const ov = dom.layerOverlay.getBoundingClientRect();
+  drag = {
+    L, role, ovRect: ov,
+    startX: e.clientX, startY: e.clientY,
+    startFx: L.fx, startFy: L.fy, startFw: L.fw, startRot: L.rot,
+  };
+  if (role === "del") {
+    deleteLayer(L.id);
+    drag = null;
+    return;
+  }
+  e.target.setPointerCapture?.(e.pointerId);
+  window.addEventListener("pointermove", moveLayerPointer);
+  window.addEventListener("pointerup", endLayerPointer);
+  renderLayers();
+  updateSceneButtons();
+}
+function moveLayerPointer(e) {
+  if (!drag) return;
+  const { L, role, ovRect } = drag;
+  const ow = ovRect.width, oh = ovRect.height;
+  if (role === "move") {
+    L.fx = clamp01(drag.startFx + (e.clientX - drag.startX) / ow);
+    L.fy = clamp01(drag.startFy + (e.clientY - drag.startY) / oh);
+  } else if (role === "resize") {
+    const cx = ovRect.left + L.fx * ow;
+    const cy = ovRect.top + L.fy * oh;
+    const dist = Math.hypot(e.clientX - cx, e.clientY - cy); // to corner = half diagonal
+    const aspect = L.imgH / L.imgW;
+    const widthPx = (2 * dist) / Math.sqrt(1 + aspect * aspect);
+    L.fw = Math.max(0.04, Math.min(2.5, widthPx / ow));
+  } else if (role === "rotate") {
+    const cx = ovRect.left + L.fx * ow;
+    const cy = ovRect.top + L.fy * oh;
+    const ang = (Math.atan2(e.clientY - cy, e.clientX - cx) * 180) / Math.PI;
+    L.rot = ang + 90; // handle sits above center
+  }
+  renderLayers();
+}
+function endLayerPointer() {
+  drag = null;
+  window.removeEventListener("pointermove", moveLayerPointer);
+  window.removeEventListener("pointerup", endLayerPointer);
+}
+const clamp01 = (v) => Math.max(-0.1, Math.min(1.1, v));
+
+function deleteLayer(id) {
+  state.scene.layers = state.scene.layers.filter((x) => x.id !== id);
+  if (state.scene.selectedId === id) state.scene.selectedId = null;
+  renderLayers();
+  updateSceneButtons();
 }
 
-/* ---------------------------------------------------------------
-   Download
---------------------------------------------------------------- */
-function downloadCurrent() {
-  const url = currentImageDataUrl();
-  if (!url) return;
+function updateSceneButtons() {
+  const hasScene = !!state.scene.currentId;
+  const hasLayers = state.scene.layers.length > 0;
+  const hasSel = !!state.scene.selectedId;
+  dom.blendBtn.disabled = !hasScene || state.scene.busy;
+  dom.sendBtn.disabled = !hasScene || state.scene.busy || dom.prompt.value.trim().length === 0;
+  dom.sceneDownloadBtn.disabled = !hasScene;
+  dom.layerDeleteBtn.disabled = !hasSel;
+  dom.layerFlattenReset.disabled = !hasLayers;
+  dom.blendBtn.textContent = hasLayers ? "✨ Blend items into scene" : "✨ Enhance scene";
+}
+
+/* ---- Flatten base + layers to one PNG ---- */
+function flattenScene() {
+  const base = dom.sceneImg;
+  const W = base.naturalWidth, H = base.naturalHeight;
+  const cv = document.createElement("canvas");
+  cv.width = W; cv.height = H;
+  const ctx = cv.getContext("2d");
+  ctx.drawImage(base, 0, 0, W, H);
+  const sorted = [...state.scene.layers].sort((a, b) => a.z - b.z);
+  for (const L of sorted) {
+    const w = L.fw * W;
+    const h = w * (L.imgH / L.imgW);
+    ctx.save();
+    ctx.translate(L.fx * W, L.fy * H);
+    ctx.rotate((L.rot * Math.PI) / 180);
+    ctx.drawImage(L.img, -w / 2, -h / 2, w, h);
+    ctx.restore();
+  }
+  return cv.toDataURL("image/png");
+}
+
+/* ---- Run a scene edit / blend ---- */
+async function runSceneEdit(promptText) {
+  if (!state.scene.currentId || state.scene.busy) return;
+  const hasLayers = state.scene.layers.length > 0;
+  const composite = hasLayers ? flattenScene() : currentSceneUrl();
+
+  const instruction = hasLayers
+    ? `${promptText}\n\nContext: this image is a rough composite — some elements were pasted on top of a base scene. ` +
+      `Integrate every pasted element seamlessly and photorealistically: match perspective, scale and lighting ` +
+      `direction, add realistic contact and cast shadows, match color temperature and grain, and blend all edges. ` +
+      `Keep each element roughly where it is placed. Output a single natural photograph.`
+    : promptText;
+
+  addMessage("user", `<p>${escapeHtml(promptText)}</p>`);
+  sceneBusy(true, hasLayers ? "Blending…" : "Editing…");
+  try {
+    const { imageOut, textOut } = await callGemini(instruction, [composite]);
+    if (!imageOut) {
+      addMessage("assistant", `<p>${textOut ? escapeHtml(textOut) : "No image returned — try rephrasing."}</p>`, { isError: !textOut });
+      return;
+    }
+    pushSceneVersion(imageOut);
+    state.scene.layers = [];          // items are now baked into the scene
+    state.scene.selectedId = null;
+    await showScene(imageOut);
+    renderLayers();
+    addMessage("assistant", `<p>${textOut ? escapeHtml(textOut) : "Done — items blended in."}</p>`, { thumbUrl: imageOut });
+  } catch (err) {
+    addMessage("assistant", `<p>⚠️ ${escapeHtml(err.message || "Something went wrong.")}</p>`, { isError: true });
+    toast(err.message || "Edit failed", true);
+  } finally {
+    sceneBusy(false);
+    updateSceneButtons();
+  }
+}
+function sceneBusy(b, text = "Working…") {
+  state.scene.busy = b;
+  dom.sceneLoading.hidden = !b;
+  dom.sceneLoadingText.textContent = text;
+  updateSceneButtons();
+}
+
+/* ---- Scene history ---- */
+function renderHistory() {
+  dom.historyStrip.hidden = state.tab === "cut" || state.scene.versions.length === 0;
+  dom.historyItems.innerHTML = "";
+  state.scene.versions.forEach((v, i) => {
+    const t = document.createElement("div");
+    t.className = "thumb" + (v.id === state.scene.currentId ? " active" : "");
+    t.innerHTML = `<img src="${v.dataUrl}" alt="v${i + 1}" /><span class="thumb-badge">${i === 0 ? "base" : "v" + i}</span>`;
+    t.addEventListener("click", async () => {
+      state.scene.currentId = v.id;
+      state.scene.layers = [];
+      state.scene.selectedId = null;
+      await showScene(v.dataUrl);
+      renderLayers();
+      renderHistory();
+      updateSceneButtons();
+    });
+    dom.historyItems.appendChild(t);
+  });
+}
+
+/* ---------------- Chat ---------------- */
+function addMessage(role, html, { thumbUrl = null, isError = false } = {}) {
+  const wrap = document.createElement("div");
+  wrap.className = `msg msg-${role}` + (isError ? " msg-error" : "");
+  wrap.innerHTML =
+    `<div class="msg-avatar">${role === "user" ? "🧑" : "🎨"}</div>` +
+    `<div class="msg-bubble">${html}${thumbUrl ? `<img class="msg-thumb" src="${thumbUrl}" alt="result" />` : ""}</div>`;
+  dom.messages.appendChild(wrap);
+  dom.messages.scrollTop = dom.messages.scrollHeight;
+}
+
+/* ---------------- Download ---------------- */
+function downloadUrl(url, name) {
   const a = document.createElement("a");
-  a.href = url;
-  const n = state.versions.findIndex((v) => v.id === state.currentVersionId);
-  a.download = `photo-studio-${n >= 0 ? "v" + (n + 1) : "source"}.png`;
-  a.click();
+  a.href = url; a.download = name; a.click();
 }
 
-/* ---------------------------------------------------------------
-   Settings modal
---------------------------------------------------------------- */
+/* ---------------- Settings ---------------- */
 function openSettings() {
   dom.apiKeyInput.value = settings.apiKey;
   dom.modelInput.value = settings.model;
   dom.settingsModal.hidden = false;
-}
-function closeSettings() {
-  dom.settingsModal.hidden = true;
 }
 function saveSettings() {
   settings.apiKey = dom.apiKeyInput.value.trim();
   settings.model = dom.modelInput.value.trim() || "gemini-2.5-flash-image";
   localStorage.setItem("cps_apiKey", settings.apiKey);
   localStorage.setItem("cps_model", settings.model);
-  closeSettings();
-  updateSendState();
+  dom.settingsModal.hidden = true;
+  updateSceneButtons();
   toast(settings.apiKey ? "Settings saved." : "Key cleared.");
 }
 
-/* ---------------------------------------------------------------
-   New session
---------------------------------------------------------------- */
+/* ---------------- New session ---------------- */
 function newSession() {
-  if (state.versions.length && !confirm("Start over? This clears the current photos and history.")) return;
-  state.sources = [];
-  state.versions = [];
-  state.currentVersionId = null;
-  if (state.masking) toggleMask();
-  clearMask();
-  // Keep the intro message; drop the rest.
+  if (!confirm("Start over? This clears the current scene and cut-out (your saved Library is kept).")) return;
+  state.cut = { src: null, result: null, busy: false };
+  state.scene = { versions: [], currentId: null, layers: [], selectedId: null, busy: false, zTop: 1 };
+  dom.cutEmpty.hidden = false; dom.cutWrap.hidden = true;
+  dom.cutSaveBtn.disabled = true; dom.cutDownloadBtn.disabled = true; dom.cutRunBtn.disabled = true;
+  dom.cutPrompt.value = "";
+  dom.sceneEmpty.hidden = false; dom.sceneWrap.hidden = true;
+  dom.layerOverlay.innerHTML = "";
   [...dom.messages.children].slice(1).forEach((n) => n.remove());
-  render();
+  renderHistory(); updateSceneButtons();
 }
 
-/* ---------------------------------------------------------------
-   Composer sizing
---------------------------------------------------------------- */
+/* ---------------- Composer sizing ---------------- */
 function autoGrow() {
   dom.prompt.style.height = "auto";
-  dom.prompt.style.height = Math.min(dom.prompt.scrollHeight, 160) + "px";
+  dom.prompt.style.height = Math.min(dom.prompt.scrollHeight, 140) + "px";
 }
 
-/* ---------------------------------------------------------------
-   Wiring
---------------------------------------------------------------- */
+/* ============================================================
+   WIRING
+   ============================================================ */
 function init() {
-  // Uploads
-  dom.uploadTrigger.addEventListener("click", () => dom.fileInput.click());
-  dom.addMoreBtn.addEventListener("click", () => dom.fileInput.click());
+  loadLibrary();
+  renderLibrary();
+  updateSceneButtons();
+
+  // Tabs
+  document.querySelectorAll(".tab").forEach((t) => t.addEventListener("click", () => setTab(t.dataset.tab)));
+
+  // Uploads (shared input, target set per trigger)
+  const openPicker = (target) => { uploadTarget = target; dom.fileInput.click(); };
+  dom.cutUploadTrigger.addEventListener("click", () => openPicker("cut"));
+  dom.cutAddBtn.addEventListener("click", () => openPicker("cut"));
+  dom.sceneUploadTrigger.addEventListener("click", () => openPicker("scene"));
+  dom.sceneAddBtn.addEventListener("click", () => openPicker("scene"));
   dom.fileInput.addEventListener("change", (e) => {
-    addFiles(e.target.files);
+    const f = e.target.files?.[0];
+    if (f && f.type.startsWith("image/")) (uploadTarget === "cut" ? cutSetSource : sceneSetBase)(f);
     dom.fileInput.value = "";
   });
 
-  // Drag & drop
-  ["dragenter", "dragover"].forEach((ev) =>
-    dom.dropZone.addEventListener(ev, (e) => {
+  // Drag & drop per stage
+  const wireDrop = (zone, handler) => {
+    ["dragenter", "dragover"].forEach((ev) => zone.addEventListener(ev, (e) => { e.preventDefault(); zone.classList.add("dragover"); }));
+    ["dragleave", "drop"].forEach((ev) => zone.addEventListener(ev, (e) => {
       e.preventDefault();
-      dom.dropZone.classList.add("dragover");
-    })
-  );
-  ["dragleave", "drop"].forEach((ev) =>
-    dom.dropZone.addEventListener(ev, (e) => {
-      e.preventDefault();
-      if (ev === "dragleave" && dom.dropZone.contains(e.relatedTarget)) return;
-      dom.dropZone.classList.remove("dragover");
-    })
-  );
-  dom.dropZone.addEventListener("drop", (e) => addFiles(e.dataTransfer.files));
+      if (ev === "dragleave" && zone.contains(e.relatedTarget)) return;
+      zone.classList.remove("dragover");
+    }));
+    zone.addEventListener("drop", (e) => {
+      const f = [...(e.dataTransfer?.files || [])].find((x) => x.type.startsWith("image/"));
+      if (f) handler(f);
+    });
+  };
+  wireDrop(dom.cutStage, cutSetSource);
+  wireDrop(dom.sceneStage, sceneSetBase);
 
-  // Paste
-  window.addEventListener("paste", (e) => {
-    const items = [...(e.clipboardData?.items || [])].filter((i) => i.type.startsWith("image/"));
-    if (items.length) addFiles(items.map((i) => i.getAsFile()).filter(Boolean));
-  });
+  // Cut actions
+  dom.cutRunBtn.addEventListener("click", runCut);
+  dom.cutSaveBtn.addEventListener("click", saveCutToLibrary);
+  dom.cutDownloadBtn.addEventListener("click", () => state.cut.result && downloadUrl(state.cut.result, "cutout.png"));
+  dom.cutPrompt.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); runCut(); } });
+  document.querySelectorAll("[data-cut]").forEach((c) =>
+    c.addEventListener("click", () => { dom.cutPrompt.value = c.dataset.cut; runCut(); })
+  );
 
-  // Composer
-  dom.prompt.addEventListener("input", () => {
-    autoGrow();
-    updateSendState();
+  // Scene actions
+  dom.blendBtn.addEventListener("click", () => {
+    const preset = "Integrate the placed items into the scene photorealistically: match perspective and scale, add realistic contact shadows and cast shadows, match the light direction and color temperature, and color-grade everything to look like one photograph.";
+    runSceneEdit(state.scene.layers.length ? preset : "Enhance this image: balance the lighting, refine the color grade, and make it look like a polished natural photograph.");
   });
+  dom.layerDeleteBtn.addEventListener("click", () => state.scene.selectedId && deleteLayer(state.scene.selectedId));
+  dom.layerFlattenReset.addEventListener("click", () => { state.scene.layers = []; state.scene.selectedId = null; renderLayers(); updateSceneButtons(); });
+  dom.sceneDownloadBtn.addEventListener("click", () => {
+    const url = state.scene.layers.length ? flattenScene() : currentSceneUrl();
+    if (url) downloadUrl(url, "scene.png");
+  });
+  document.querySelectorAll("[data-scene]").forEach((c) =>
+    c.addEventListener("click", () => runSceneEdit(c.dataset.scene))
+  );
+  dom.prompt.addEventListener("input", () => { autoGrow(); updateSceneButtons(); });
   dom.prompt.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      if (!dom.sendBtn.disabled) submitEdit(dom.prompt.value);
-    }
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); if (!dom.sendBtn.disabled) { runSceneEdit(dom.prompt.value.trim()); dom.prompt.value = ""; autoGrow(); } }
   });
   dom.composer.addEventListener("submit", (e) => {
     e.preventDefault();
-    submitEdit(dom.prompt.value);
+    const v = dom.prompt.value.trim();
+    if (v) { runSceneEdit(v); dom.prompt.value = ""; autoGrow(); }
   });
 
-  // Quick actions
-  dom.quickActions.addEventListener("click", (e) => {
-    const chip = e.target.closest(".chip");
-    if (!chip) return;
-    const p = chip.dataset.prompt;
-    if (state.sources.length === 0 && state.versions.length === 0) {
-      toast("Add a photo first, then tap a quick action.", true);
-      return;
+  // Deselect layer when clicking empty scene area
+  dom.sceneWrap.addEventListener("pointerdown", (e) => {
+    if (e.target === dom.sceneWrap || e.target === dom.sceneImg || e.target === dom.layerOverlay) {
+      state.scene.selectedId = null; renderLayers(); updateSceneButtons();
     }
-    submitEdit(p);
   });
 
-  // Toolbar
-  dom.maskToggle.addEventListener("click", toggleMask);
-  dom.maskClear.addEventListener("click", clearMask);
-  dom.downloadBtn.addEventListener("click", downloadCurrent);
-
-  // Mask drawing
-  const c = dom.maskCanvas;
-  c.addEventListener("mousedown", maskDown);
-  c.addEventListener("mousemove", maskMove);
-  window.addEventListener("mouseup", maskUp);
-  c.addEventListener("touchstart", maskDown, { passive: false });
-  c.addEventListener("touchmove", maskMove, { passive: false });
-  c.addEventListener("touchend", maskUp);
-
-  // Keep mask aligned if the window resizes while masking.
-  window.addEventListener("resize", () => {
-    if (state.masking) setupMaskCanvas();
-  });
+  window.addEventListener("resize", () => { if (state.tab === "scene") positionOverlay(); });
 
   // Settings
   dom.settingsBtn.addEventListener("click", openSettings);
-  dom.settingsClose.addEventListener("click", closeSettings);
+  dom.settingsClose.addEventListener("click", () => (dom.settingsModal.hidden = true));
   dom.settingsSave.addEventListener("click", saveSettings);
-  dom.settingsModal.addEventListener("click", (e) => {
-    if (e.target === dom.settingsModal) closeSettings();
-  });
+  dom.settingsModal.addEventListener("click", (e) => { if (e.target === dom.settingsModal) dom.settingsModal.hidden = true; });
 
-  // New session
   dom.newSessionBtn.addEventListener("click", newSession);
 
-  // First run: nudge for a key.
-  render();
-  if (!settings.apiKey) {
-    setTimeout(() => {
-      addMessage(
-        "assistant",
-        `<p>⚙️ First, add your <strong>free</strong> Google AI Studio API key in <strong>Settings</strong> (top right) so I can edit your photos.</p>`
-      );
-    }, 400);
-  }
+  if (!settings.apiKey) setTimeout(openSettings, 350);
 }
 
 document.addEventListener("DOMContentLoaded", init);
