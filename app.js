@@ -76,13 +76,16 @@ function cvOf(w, h) { const c = document.createElement("canvas"); c.width = w; c
    Background removal engine (lazy-loaded, cached)
    ============================================================ */
 let _imgly = null;
-/* Browser-bundled builds only — the raw dist/index.mjs has bare imports
-   (zod, ndarray, lodash-es) that don't resolve in a browser. jsDelivr's
-   "/+esm" and esm.sh bundle those dependencies for us. */
+/* Load a browser-bundled build. Two hard requirements:
+   1) Use a "/+esm" (jsDelivr) or esm.sh URL so the library's own bare
+      imports (zod, ndarray, lodash-es) get bundled for the browser.
+   2) Pin to 1.5.7 — the last release where onnxruntime-web is a REGULAR
+      dependency (so the bundler includes it). From 1.5.8 on it became a
+      *peer* dependency, which the bundler externalises → the runtime
+      error "failed to resolve onnxruntime". */
 const IMGLY_SOURCES = [
-  "https://cdn.jsdelivr.net/npm/@imgly/background-removal@1.7.0/+esm",
-  "https://esm.sh/@imgly/background-removal@1.7.0",
-  "https://cdn.jsdelivr.net/npm/@imgly/background-removal@1/+esm",
+  "https://cdn.jsdelivr.net/npm/@imgly/background-removal@1.5.7/+esm",
+  "https://esm.sh/@imgly/background-removal@1.5.7",
 ];
 async function ensureImgly() {
   if (_imgly) return _imgly;
