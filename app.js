@@ -72,6 +72,24 @@ function loadImage(src) {
 }
 function cvOf(w, h) { const c = document.createElement("canvas"); c.width = w; c.height = h; return c; }
 
+/* Re-encode any browser-decodable image to a clean PNG Blob (and cap huge
+   phone photos). This normalises the input so the background-removal
+   decoder gets a format it can read, and gives a clear error otherwise. */
+async function toPngBlob(dataUrl, maxDim = 2048) {
+  let img;
+  try { img = await loadImage(dataUrl); }
+  catch { throw new Error("This photo couldn't be read. Try a JPG or PNG — some phone photos (HEIC) aren't supported. A screenshot of the photo also works."); }
+  let w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+  if (!w || !h) throw new Error("This photo couldn't be read. Try a different image (JPG or PNG).");
+  const scale = Math.min(1, maxDim / Math.max(w, h));
+  w = Math.round(w * scale); h = Math.round(h * scale);
+  const c = cvOf(w, h);
+  c.getContext("2d").drawImage(img, 0, 0, w, h);
+  return await new Promise((res, rej) =>
+    c.toBlob((b) => (b ? res(b) : rej(new Error("Could not process this image."))), "image/png")
+  );
+}
+
 /* ============================================================
    Background removal engine (lazy-loaded, cached)
    ============================================================ */
@@ -140,10 +158,13 @@ async function cutSetSource(file) {
 
 async function runCut() {
   if (!state.cut.file || state.cut.busy) return;
-  cutBusy(true, "Loading model…");
+  cutBusy(true, "Reading photo…");
   try {
-    const removeBackground = await ensureImgly();
-    const blob = await removeBackground(state.cut.file, {
+    // Normalise the input to a clean PNG the model's decoder can read.
+    const pngBlob = await toPngBlob(state.cut.src);
+    cutBusy(true, "Loading model…");
+    const removeBackground = window.__cpsRemoveBg || (await ensureImgly());
+    const blob = await removeBackground(pngBlob, {
       output: { format: "image/png" },
       progress: (key, current, total) => {
         if (key && key.startsWith("fetch")) {
