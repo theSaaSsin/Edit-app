@@ -312,6 +312,24 @@ body {
 .lcard-body .row { margin-top: 6px; }
 .lcard-body .mini-select { flex: 1 1 auto; }
 
+/* Brush bar */
+.brush-bar {
+  margin-top: 9px; padding: 10px 12px; border: 1px solid var(--accent);
+  background: #1b1610; border-radius: 11px;
+}
+.brush-tools { display: flex; flex-wrap: wrap; gap: 6px; }
+.brush-tools + .brush-tools { margin-top: 8px; }
+.brush-rows { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; margin: 10px 0 2px; }
+.brush-slider { display: block; font-size: 11.5px; color: var(--text-dim); }
+.brush-slider span { display: block; margin-bottom: 3px; }
+.brush-slider b { color: var(--accent-strong); font-variant-numeric: tabular-nums; }
+.brush-hint { margin: 9px 0 0; font-size: 11.5px; color: var(--text-faint); line-height: 1.45; }
+
+/* Paint surface: the overlay swallows pointer events while brushing */
+.layer-overlay.painting { pointer-events: auto; cursor: crosshair; touch-action: none; }
+.stage-canvas.brush-mode { border-color: var(--accent); }
+.stage-canvas.brush-mode .preview-img { cursor: crosshair; }
+
 /* Responsive */
 @media (max-width: 880px) {
   body { overflow: auto; }

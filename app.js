@@ -96,6 +96,22 @@ const LOOKS = {
     overlay: { opacity: 32, blend: "soft-light", saturation: -20 },
     finish: { vignette: 18, grain: 34, fade: 26 },
   },
+  night: {
+    name: "Night", icon: "🌙", match: 0.9,
+    base: { exposure: -46, contrast: 18, saturation: -34, temperature: -40, highlights: -26, shadows: -10 },
+    subject: { exposure: -14, temperature: -12, saturation: -10 },
+    overlay: { opacity: 18, blend: "soft-light", saturation: -40, exposure: -20 },
+    finish: { vignette: 52, grain: 20, fade: 4 },
+    glow: { visible: true, count: 34, size: 26, spread: 62, cy: 64, intensity: 70, hue: 68 },
+  },
+  fireflies: {
+    name: "Fireflies", icon: "🪰", match: 0.9,
+    base: { exposure: -38, contrast: 14, saturation: -20, temperature: -28, highlights: -20 },
+    subject: { exposure: -10, temperature: -8 },
+    overlay: { opacity: 14, blend: "soft-light", saturation: -30, exposure: -18 },
+    finish: { vignette: 46, grain: 16, fade: 6 },
+    glow: { visible: true, count: 90, size: 18, spread: 78, cy: 58, intensity: 85, hue: 62 },
+  },
   noir: {
     name: "Ink noir", icon: "⚫", match: 0.85,
     base: { saturation: -100, contrast: 30, shadows: -14 },
@@ -116,8 +132,11 @@ const state = {
     layers: [],
     overlay: { dataUrl: null, img: null, visible: true, blend: "soft-light", opacity: 40, rot: 0, flipH: false, adj: newAdj() },
     finish: { visible: true, vignette: 0, grain: 0, fade: 0 },
+    glow: { visible: false, count: 0, size: 30, spread: 60, cy: 62, intensity: 65, hue: 68, seed: 7 },
     selectedId: null, zTop: 1, look: null,
+    refine: { reach: 45, strength: 80, spill: 80 },
   },
+  brush: { on: false, tool: "erase", size: 12, soft: 60, strength: 70 },
 };
 let idSeq = 0;
 const uid = (p) => `${p}_${Date.now().toString(36)}_${idSeq++}`;
@@ -131,7 +150,7 @@ const dom = {};
   "cutRotL","cutRotR","cutFlip",
   "sceneStage","sceneEmpty","sceneWrap","sceneCanvas","layerOverlay",
   "cutToolbar","cutAddBtn","cutSaveBtn","cutDownloadBtn",
-  "sceneToolbar","sceneAddBtn","overlayAddBtn","layerDeleteBtn","layerFlattenReset",
+  "sceneToolbar","sceneAddBtn","overlayAddBtn","brushToggle","brushBar","layerDeleteBtn","layerFlattenReset",
   "beforeAfterBtn","sceneDownloadBtn",
   "historyStrip","historyItems",
   "libraryItems","libCount","libHint",
@@ -195,6 +214,81 @@ async function transformDataUrl(dataUrl, { rot = 0, flipH = false }) {
   if (flipH) ctx.scale(-1, 1);
   ctx.drawImage(img, -w / 2, -h / 2);
   return c.toDataURL("image/png");
+}
+
+/* ============================================================
+   CUTOUT STORAGE — source photo + separate mask
+
+   A cutout is deliberately NOT one flattened RGBA png. Background removal
+   throws the background pixels away (they come back as RGB 0,0,0 under
+   alpha 0), so a flattened cutout can never be un-erased — a restore brush
+   would have nothing to paint back, and hair the model cut off would be
+   gone for good. Keeping the untouched photo alongside a greyscale mask
+   makes every mask edit reversible and makes hair recoverable.
+   ============================================================ */
+const IDB_NAME = "cps", IDB_STORE = "library";
+function idb() {
+  return new Promise((res, rej) => {
+    const rq = indexedDB.open(IDB_NAME, 1);
+    rq.onupgradeneeded = () => { if (!rq.result.objectStoreNames.contains(IDB_STORE)) rq.result.createObjectStore(IDB_STORE, { keyPath: "id" }); };
+    rq.onsuccess = () => res(rq.result);
+    rq.onerror = () => rej(rq.error);
+  });
+}
+async function idbAll() {
+  try {
+    const db = await idb();
+    return await new Promise((res, rej) => {
+      const rq = db.transaction(IDB_STORE).objectStore(IDB_STORE).getAll();
+      rq.onsuccess = () => res(rq.result || []); rq.onerror = () => rej(rq.error);
+    });
+  } catch { return null; }
+}
+async function idbPut(item) {
+  try { const db = await idb(); db.transaction(IDB_STORE, "readwrite").objectStore(IDB_STORE).put(item); return true; }
+  catch { return false; }
+}
+async function idbDel(id) {
+  try { const db = await idb(); db.transaction(IDB_STORE, "readwrite").objectStore(IDB_STORE).delete(id); } catch {}
+}
+
+/* Pull a greyscale mask out of an RGBA cutout's alpha channel. */
+function maskFromAlpha(img) {
+  const c = cvOf(img.naturalWidth || img.width, img.naturalHeight || img.height);
+  const x = c.getContext("2d");
+  x.drawImage(img, 0, 0);
+  const id = x.getImageData(0, 0, c.width, c.height);
+  const d = id.data;
+  for (let i = 0; i < d.length; i += 4) {
+    const a = d[i + 3];
+    d[i] = d[i + 1] = d[i + 2] = a; d[i + 3] = 255;
+  }
+  x.putImageData(id, 0, 0);
+  return c;
+}
+/* src + mask -> a normal RGBA cutout (thumbnails, downloads). */
+function applyMask(srcImg, maskSrc, w, h) {
+  const W = w || srcImg.naturalWidth || srcImg.width, H = h || srcImg.naturalHeight || srcImg.height;
+  const c = cvOf(W, H);
+  const x = c.getContext("2d");
+  x.drawImage(srcImg, 0, 0, W, H);
+  const m = cvOf(W, H);
+  m.getContext("2d").drawImage(maskSrc, 0, 0, W, H);
+  const id = x.getImageData(0, 0, W, H), md = m.getContext("2d").getImageData(0, 0, W, H).data;
+  const d = id.data;
+  for (let i = 0; i < d.length; i += 4) d[i + 3] = md[i];
+  x.putImageData(id, 0, 0);
+  return c;
+}
+/* Downscale a photo for storage — full phone resolution in the library is
+   what pushes it past any browser quota. */
+async function fitDataUrl(dataUrl, maxDim, type = "image/jpeg", q = 0.86) {
+  const img = await loadImage(dataUrl);
+  const w0 = img.naturalWidth, h0 = img.naturalHeight;
+  const s = Math.min(1, maxDim / Math.max(w0, h0));
+  const c = cvOf(w0 * s, h0 * s);
+  c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+  return c.toDataURL(type, q);
 }
 
 /* ============================================================
@@ -329,6 +423,144 @@ function refineMatte(src, m) {
   return out;
 }
 
+/* ============================================================
+   HAIR / EDGE REFINEMENT
+
+   Background removal returns a hard silhouette: on the sample photo the
+   matte was 688k fully-transparent and 615k fully-opaque pixels with
+   literally nothing in between, so every hair strand was either chopped
+   off or left welded to a chunk of bright sky.
+
+   This recovers the in-between. Around the matte edge it estimates the
+   local foreground colour F and background colour B by push-pull blurring
+   the pixels that are confidently inside and confidently outside, then
+   solves each band pixel for where it sits on the F→B colour line:
+
+       alpha = clamp( (C-B)·(F-B) / |F-B|² )
+
+   Hair against a bright sky separates strongly on that line, so strands
+   come back as genuine partial alpha. The same F and B then let us
+   un-mix the colour — F = (C-(1-a)B)/a — which removes the background
+   spill that reads as a glowing rim. That's a real fix, as opposed to
+   just darkening the edge and hoping.
+   ============================================================ */
+function boxBlur(buf, w, h, r, ch) {
+  const tmp = new Float32Array(buf.length);
+  const win = r * 2 + 1;
+  for (let y = 0; y < h; y++) {           // horizontal
+    for (let c = 0; c < ch; c++) {
+      let acc = 0;
+      for (let x = -r; x <= r; x++) acc += buf[(y * w + clamp(x, 0, w - 1)) * ch + c];
+      for (let x = 0; x < w; x++) {
+        tmp[(y * w + x) * ch + c] = acc / win;
+        acc += buf[(y * w + clamp(x + r + 1, 0, w - 1)) * ch + c] - buf[(y * w + clamp(x - r, 0, w - 1)) * ch + c];
+      }
+    }
+  }
+  for (let x = 0; x < w; x++) {           // vertical
+    for (let c = 0; c < ch; c++) {
+      let acc = 0;
+      for (let y = -r; y <= r; y++) acc += tmp[(clamp(y, 0, h - 1) * w + x) * ch + c];
+      for (let y = 0; y < h; y++) {
+        buf[(y * w + x) * ch + c] = acc / win;
+        acc += tmp[(clamp(y + r + 1, 0, h - 1) * w + x) * ch + c] - tmp[(clamp(y - r, 0, h - 1) * w + x) * ch + c];
+      }
+    }
+  }
+}
+
+/* Returns { mask, decon } canvases at working resolution. */
+function refineHair(srcImg, maskSrc, { reach = 45, strength = 80, spill = 80 } = {}) {
+  const maxDim = 1100;
+  const w0 = srcImg.naturalWidth || srcImg.width, h0 = srcImg.naturalHeight || srcImg.height;
+  const s = Math.min(1, maxDim / Math.max(w0, h0));
+  const W = Math.max(2, Math.round(w0 * s)), H = Math.max(2, Math.round(h0 * s));
+
+  const sc = cvOf(W, H); sc.getContext("2d").drawImage(srcImg, 0, 0, W, H);
+  const S = sc.getContext("2d").getImageData(0, 0, W, H).data;
+  const mc = cvOf(W, H); mc.getContext("2d").drawImage(maskSrc, 0, 0, W, H);
+  const M = mc.getContext("2d").getImageData(0, 0, W, H).data;
+
+  const N = W * H;
+  const a0 = new Float32Array(N);
+  for (let i = 0; i < N; i++) a0[i] = M[i * 4] / 255;
+
+  const R = Math.max(2, Math.round((reach / 100) * Math.min(W, H) / 26));
+
+  // Push-pull: colour sums weighted by confident-inside / confident-outside.
+  const inB = new Float32Array(N * 4), outB = new Float32Array(N * 4);
+  for (let i = 0; i < N; i++) {
+    const j = i * 4, a = a0[i];
+    const wi = a > 0.92 ? 1 : 0, wo = a < 0.08 ? 1 : 0;
+    inB[j] = S[j] * wi; inB[j + 1] = S[j + 1] * wi; inB[j + 2] = S[j + 2] * wi; inB[j + 3] = wi;
+    outB[j] = S[j] * wo; outB[j + 1] = S[j + 1] * wo; outB[j + 2] = S[j + 2] * wo; outB[j + 3] = wo;
+  }
+  boxBlur(inB, W, H, R, 4);
+  boxBlur(outB, W, H, R, 4);
+
+  const band = new Float32Array(a0);
+  boxBlur(band, W, H, R, 1);
+
+  const k = strength / 100, kS = spill / 100;
+  const outMask = cvOf(W, H), dec = cvOf(W, H);
+  const mo = outMask.getContext("2d").createImageData(W, H);
+  const dd = dec.getContext("2d").createImageData(W, H);
+
+  for (let i = 0; i < N; i++) {
+    const j = i * 4;
+    let a = a0[i];
+    const inW = inB[j + 3], outW = outB[j + 3];
+    if (band[i] > 0.015 && band[i] < 0.985 && inW > 1e-3 && outW > 1e-3) {
+      const Fr = inB[j] / inW, Fg = inB[j + 1] / inW, Fb = inB[j + 2] / inW;
+      const Br = outB[j] / outW, Bg = outB[j + 1] / outW, Bb = outB[j + 2] / outW;
+      const dr = Fr - Br, dg = Fg - Bg, db = Fb - Bb;
+      const den = dr * dr + dg * dg + db * db;
+      if (den > 260) {                       // enough colour separation to trust
+        const am = clamp(((S[j] - Br) * dr + (S[j + 1] - Bg) * dg + (S[j + 2] - Bb) * db) / den, 0, 1);
+        a = a0[i] * (1 - k) + am * k;
+        if (kS && a > 0.03 && a < 0.985) {   // un-mix the background spill
+          const ia = 1 / a;
+          dd.data[j]     = clamp((S[j]     - (1 - a) * Br) * ia, 0, 255) * kS + S[j]     * (1 - kS);
+          dd.data[j + 1] = clamp((S[j + 1] - (1 - a) * Bg) * ia, 0, 255) * kS + S[j + 1] * (1 - kS);
+          dd.data[j + 2] = clamp((S[j + 2] - (1 - a) * Bb) * ia, 0, 255) * kS + S[j + 2] * (1 - kS);
+          dd.data[j + 3] = 255;
+        }
+      }
+    }
+    mo.data[j] = mo.data[j + 1] = mo.data[j + 2] = a * 255;
+    mo.data[j + 3] = 255;
+  }
+  outMask.getContext("2d").putImageData(mo, 0, 0);
+  dec.getContext("2d").putImageData(dd, 0, 0);
+  return { mask: outMask, decon: dec };
+}
+
+/* Local "fix light" paint — desaturate, cool and pull down the highlights
+   only where the user has brushed. This is what kills a warm rim glow that
+   belongs to the photo the subject came from. */
+function applyLocalFix(id, fixData, amount) {
+  if (!amount) return id;
+  const d = id.data, k = amount / 100;
+  for (let i = 0; i < d.length; i += 4) {
+    const t = (fixData[i] / 255) * k;
+    if (t <= 0.002 || d[i + 3] === 0) continue;
+    let r = d[i] / 255, g = d[i + 1] / 255, b = d[i + 2] / 255;
+    const L = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    const hi = clamp((L - 0.28) / 0.72, 0, 1);       // bias to the lit rim
+    const w = t * (0.5 + 0.5 * hi);
+    r = r + (L - r) * w;                             // all the way to neutral if pushed
+    g = g + (L - g) * w;
+    b = b + (L - b) * w;
+    const dark = 1 - w * (0.22 + 0.55 * hi);         // pull the glow down
+    r *= dark; g *= dark; b *= dark;
+    b += w * 0.055;                                  // and a touch cooler
+    d[i] = clamp(r, 0, 1) * 255;
+    d[i + 1] = clamp(g, 0, 1) * 255;
+    d[i + 2] = clamp(b, 0, 1) * 255;
+  }
+  return id;
+}
+
 /* Black silhouette of a sprite's alpha — the basis for both shadows. */
 function silhouetteOf(sprite) {
   const c = cvOf(sprite.width, sprite.height);
@@ -362,16 +594,29 @@ function opaqueBounds(sprite) {
 /* Build (and cache) a layer's adjusted, matte-refined sprite at width `w`.
    Rotation/flip stay out of the cache so dragging never re-renders pixels. */
 function spriteFor(L, w) {
-  const sig = JSON.stringify([L.adj, L.matte, Math.round(w)]);
+  const sig = JSON.stringify([L.adj, L.matte, L.fixAmount, L.maskRev, Math.round(w)]);
   if (L._cache && L._cache.sig === sig) return L._cache;
 
-  const h = Math.max(1, Math.round(w * (L.imgH / L.imgW)));
-  const base = cvOf(w, h);
+  const W = Math.max(2, Math.round(w));
+  const H = Math.max(2, Math.round(w * (L.imgH / L.imgW)));
+  const base = cvOf(W, H);
   const bx = base.getContext("2d");
-  bx.drawImage(L.img, 0, 0, base.width, base.height);
+  bx.drawImage(L.src, 0, 0, W, H);
+  if (L.decon) bx.drawImage(L.decon, 0, 0, W, H);   // spill-corrected edge over the original
 
-  const id = bx.getImageData(0, 0, base.width, base.height);
+  // The mask is the alpha — kept separate from the photo so it stays editable.
+  const mc = cvOf(W, H);
+  mc.getContext("2d").drawImage(L.mask, 0, 0, W, H);
+  const md = mc.getContext("2d").getImageData(0, 0, W, H).data;
+  const id = bx.getImageData(0, 0, W, H);
+  for (let i = 0; i < id.data.length; i += 4) id.data[i + 3] = md[i];
+
   applyAdjust(id, L.adj);
+  if (L.fixAmount > 0 && L.fix) {
+    const fc = cvOf(W, H);
+    fc.getContext("2d").drawImage(L.fix, 0, 0, W, H);
+    applyLocalFix(id, fc.getContext("2d").getImageData(0, 0, W, H).data, L.fixAmount);
+  }
   bx.putImageData(id, 0, 0);
 
   let sprite = refineMatte(base, L.matte);
@@ -386,6 +631,15 @@ function spriteFor(L, w) {
 
   L._cache = { sig, sprite, silhouette: silhouetteOf(sprite), bounds: opaqueBounds(sprite) };
   return L._cache;
+}
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
 }
 
 const sortedLayers = () => [...state.scene.layers].sort((a, b) => a.z - b.z);
@@ -474,7 +728,38 @@ function renderComposite(targetW, opts = {}) {
     ctx.restore();
   }
 
-  /* 3 — texture overlay */
+  /* 3 — glow specks (fireflies, embers, dust catching the light).
+     Additive, so they read as emitted light rather than pasted dots. */
+  const G = S.glow;
+  if (G.visible && G.count > 0) {
+    const rnd = mulberry32((G.seed | 0) * 2654435761 + 12345);
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    for (let i = 0; i < G.count; i++) {
+      const sx = (rnd() - 0.5) * (G.spread / 100) * 1.15;
+      const sy = (rnd() - 0.5) * (G.spread / 100) * 0.85;
+      const x = W * (0.5 + sx);
+      const y = H * (G.cy / 100 + sy);
+      if (x < -50 || x > W + 50 || y < -50 || y > H + 50) continue;
+      const depth = rnd();                                  // near specks are bigger and brighter
+      const r = Math.max(1.5, unit * (G.size / 100) * (0.35 + depth * 1.5));
+      const b = (G.intensity / 100) * (0.3 + depth * 0.7);
+      const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+      g.addColorStop(0,    `hsla(${G.hue},72%,94%,${(0.95 * b).toFixed(3)})`);
+      g.addColorStop(0.18, `hsla(${G.hue},95%,66%,${(0.62 * b).toFixed(3)})`);
+      g.addColorStop(0.45, `hsla(${G.hue},95%,54%,${(0.20 * b).toFixed(3)})`);
+      g.addColorStop(1,    `hsla(${G.hue},95%,50%,0)`);
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+      if (depth > 0.72) {                                    // hot core on the near ones
+        ctx.fillStyle = `hsla(${G.hue},60%,97%,${(0.9 * b).toFixed(3)})`;
+        ctx.beginPath(); ctx.arc(x, y, Math.max(0.6, r * 0.11), 0, Math.PI * 2); ctx.fill();
+      }
+    }
+    ctx.restore();
+  }
+
+  /* 4 — texture overlay */
   const ov = S.overlay;
   if (ov.img && ov.visible && ov.opacity > 0) {
     const ow = ov.img.naturalWidth, oh = ov.img.naturalHeight;
@@ -501,7 +786,7 @@ function renderComposite(targetW, opts = {}) {
     ctx.restore();
   }
 
-  /* 4 — finish */
+  /* 5 — finish */
   const F = S.finish;
   if (F.visible) {
     if (F.vignette > 0) {
@@ -622,9 +907,8 @@ function harmonizeLayer(L, strength = 0.85) {
   const region = { x: r.x - pad, y: r.y - pad, w: r.w + pad * 2, h: r.h + pad * 2 };
   const sceneStats = statsFrom(bd, W, H, region, false) || statsFrom(bd, W, H, { x: 0, y: 0, w: W, h: H }, false);
 
-  const sw = 320, sh = Math.round(sw * (L.imgH / L.imgW));
-  const sc = cvOf(sw, sh);
-  sc.getContext("2d").drawImage(L.img, 0, 0, sw, sh);
+  const sw = 320, sh = Math.max(1, Math.round(sw * (L.imgH / L.imgW)));
+  const sc = applyMask(L.src, L.mask, sw, sh);
   const sd = sc.getContext("2d").getImageData(0, 0, sw, sh).data;
   const subjStats = statsFrom(sd, sw, sh, { x: 0, y: 0, w: sw, h: sh }, true);
 
@@ -763,18 +1047,72 @@ function cutBusy(b, text = "Removing background…") {
   dom.cutLoadingText.textContent = text;
   dom.cutRunBtn.disabled = b || !state.cut.file;
 }
-function saveCutToLibrary() {
+async function saveCutToLibrary() {
   if (!state.cut.result) return;
-  state.library.push({ id: uid("lib"), dataUrl: state.cut.result });
-  persistLibrary(); renderLibrary();
-  toast("Saved to Library ✓ — open Compose and tap it to place.");
+  try {
+    const cutImg = await loadImage(state.cut.result);
+    const srcImg = await loadImage(state.cut.src);
+    const fullMask = maskFromAlpha(cutImg);
+
+    // Trim to what's actually in the cutout. A subject that fills a quarter
+    // of its own frame makes scaling, positioning and brushing all behave
+    // as if the empty margin were part of the subject.
+    const b = opaqueBounds(applyMask(cutImg, fullMask));
+    const pad = Math.round(Math.max(b.w, b.h) * 0.02);
+    const X = clamp(b.x - pad, 0, cutImg.naturalWidth - 1);
+    const Y = clamp(b.y - pad, 0, cutImg.naturalHeight - 1);
+    const W = clamp(b.w + pad * 2, 1, cutImg.naturalWidth - X);
+    const H = clamp(b.h + pad * 2, 1, cutImg.naturalHeight - Y);
+
+    const crop = (img) => {
+      const c = cvOf(W, H);
+      c.getContext("2d").drawImage(img, X, Y, W, H, 0, 0, W, H);
+      return c;
+    };
+    // The untouched photo travels with the mask. Without it a restore brush
+    // has nothing to paint back — removal zeroes the RGB it erases.
+    const src = await fitDataUrl(crop(srcImg).toDataURL("image/png"), 1600, "image/jpeg", 0.9);
+    const maskC = crop(fullMask);
+    const mask = maskC.toDataURL("image/png");
+    const th = 220 / Math.max(W, H);
+    const thumbC = applyMask(await loadImage(src), maskC, Math.max(1, W * th), Math.max(1, H * th));
+    const item = { id: uid("lib"), src, mask, thumb: thumbC.toDataURL("image/png"), w: W, h: H };
+    state.library.push(item);
+    await idbPut(item);
+    renderLibrary();
+    toast("Saved to Library ✓ — open Compose and tap it to place.");
+  } catch (e) {
+    console.error(e);
+    toast("Couldn't save that cutout.", true);
+  }
 }
 
 /* ============================================================
    LIBRARY
    ============================================================ */
-function persistLibrary() { try { localStorage.setItem("cps_library", JSON.stringify(state.library)); } catch {} }
-function loadLibrary() { try { const r = localStorage.getItem("cps_library"); if (r) state.library = JSON.parse(r) || []; } catch { state.library = []; } }
+async function persistLibrary() {
+  for (const it of state.library) await idbPut(it);
+}
+async function loadLibrary() {
+  const rows = await idbAll();
+  if (rows && rows.length) { state.library = rows; return; }
+  // Migrate anything saved by the old flattened-PNG version.
+  try {
+    const raw = localStorage.getItem("cps_library");
+    if (!raw) return;
+    const old = JSON.parse(raw) || [];
+    for (const o of old) {
+      if (!o.dataUrl) continue;
+      const img = await loadImage(o.dataUrl);
+      const item = {
+        id: o.id, src: o.dataUrl, mask: maskFromAlpha(img).toDataURL("image/png"),
+        thumb: o.dataUrl, w: img.naturalWidth, h: img.naturalHeight, legacy: true,
+      };
+      state.library.push(item); await idbPut(item);
+    }
+    localStorage.removeItem("cps_library");
+  } catch {}
+}
 function renderLibrary() {
   dom.libCount.textContent = state.library.length;
   dom.libHint.hidden = state.library.length > 0;
@@ -789,7 +1127,7 @@ function renderLibrary() {
     d.className = "lib-item";
     d.dataset.id = item.id;
     d.title = state.tab === "scene" ? "Tap to place · drag to reorder" : "Drag to reorder · Compose tab to use";
-    d.innerHTML = `<img src="${item.dataUrl}" alt="cutout" draggable="false" /><span class="lib-del" data-del="${item.id}">✕</span>`;
+    d.innerHTML = `<img src="${item.thumb || item.src}" alt="cutout" draggable="false" /><span class="lib-del" data-del="${item.id}">✕</span>`;
     d.addEventListener("pointerdown", (e) => startLibPointer(e, item, d));
     dom.libraryItems.appendChild(d);
   });
@@ -804,7 +1142,7 @@ function handleLibTap(item) {
 function startLibPointer(e, item, elem) {
   if (e.target.dataset.del) {
     state.library = state.library.filter((x) => x.id !== item.id);
-    persistLibrary(); renderLibrary();
+    idbDel(item.id); renderLibrary();
     return;
   }
   libDrag = { item, elem, startX: e.clientX, startY: e.clientY, moved: false };
@@ -918,23 +1256,28 @@ function positionOverlay() {
   ov.style.height = r.height + "px";
   renderHandles();
 }
-function addLayerFromAsset(asset) {
-  loadImage(asset.dataUrl).then((im) => {
-    const L = {
-      id: uid("ly"), dataUrl: asset.dataUrl, img: im,
-      imgW: im.naturalWidth, imgH: im.naturalHeight,
-      fx: 0.5, fy: 0.58, fw: 0.42, rot: 0, flipH: false,
-      opacity: 100, visible: true, z: ++state.scene.zTop,
-      autoMatch: true, matchStrength: 85,
-      adj: newAdj(), matte: newMatte(), shadow: newShadow(),
-      name: `Subject ${state.scene.layers.length + 1}`, _cache: null,
-    };
-    state.scene.layers.push(L);
-    state.scene.selectedId = L.id;
-    autoMatchLayer(L, true);
-    buildLayerStack(); scheduleRender(); updateSceneButtons();
-    status("Placed and auto-matched to the scene. Drag to move · corner = resize · top handle = rotate.");
-  });
+async function addLayerFromAsset(asset) {
+  const src = await loadImage(asset.src);
+  const maskImg = await loadImage(asset.mask);
+  const W = src.naturalWidth, H = src.naturalHeight;
+  const mask = cvOf(W, H);
+  mask.getContext("2d").drawImage(maskImg, 0, 0, W, H);
+  const fix = cvOf(W, H);   // starts black = no local correction anywhere
+
+  const L = {
+    id: uid("ly"), assetId: asset.id, src, mask, fix, decon: null,
+    imgW: W, imgH: H, maskRev: 0, fixAmount: 70,
+    fx: 0.5, fy: 0.58, fw: 0.42, rot: 0, flipH: false,
+    opacity: 100, visible: true, z: ++state.scene.zTop,
+    autoMatch: true, matchStrength: 85,
+    adj: newAdj(), matte: newMatte(), shadow: newShadow(),
+    name: `Subject ${state.scene.layers.length + 1}`, _cache: null,
+  };
+  state.scene.layers.push(L);
+  state.scene.selectedId = L.id;
+  autoMatchLayer(L, true);
+  buildLayerStack(); scheduleRender(); updateSceneButtons();
+  status("Placed and auto-matched. Drag to move · corner = resize · ✂️ Edge to brush the mask.");
 }
 
 function renderHandles() {
@@ -942,6 +1285,7 @@ function renderHandles() {
   const ow = ov.clientWidth, oh = ov.clientHeight;
   ov.innerHTML = "";
   if (previewBase) return;
+  if (state.brush.on) return;   // the overlay itself becomes the paint surface
   for (const L of sortedLayers()) {
     if (!L.visible) continue;
     const div = document.createElement("div");
@@ -959,6 +1303,124 @@ function renderHandles() {
       `<span class="handle h-resize" data-role="resize" title="Resize">⤡</span>`;
     div.addEventListener("pointerdown", (e) => startLayerPointer(e, L));
     ov.appendChild(div);
+  }
+}
+
+/* ============================================================
+   MASK BRUSH — paint directly on the selected subject's matte
+   ============================================================ */
+const BRUSH_TOOLS = {
+  erase:   { icon: "🩹", name: "Erase",    hint: "cut leftover background away" },
+  restore: { icon: "🖌", name: "Restore",  hint: "paint the subject back in" },
+  fix:     { icon: "💡", name: "Fix light", hint: "kill a glow / match the scene's light" },
+};
+
+/* Screen point -> the layer's own mask pixels, undoing position, scale,
+   rotation and flip so the brush lands where the cursor is. */
+function pointToMask(L, clientX, clientY) {
+  const r = dom.layerOverlay.getBoundingClientRect();
+  const ow = r.width, oh = r.height;
+  const dx = clientX - r.left - L.fx * ow;
+  const dy = clientY - r.top - L.fy * oh;
+  const rad = (-L.rot * Math.PI) / 180;
+  let rx = dx * Math.cos(rad) - dy * Math.sin(rad);
+  const ry = dx * Math.sin(rad) + dy * Math.cos(rad);
+  if (L.flipH) rx = -rx;
+  const sw = L.fw * ow, sh = sw * (L.imgH / L.imgW);
+  const u = rx / sw + 0.5, v = ry / sh + 0.5;
+  return { x: u * L.mask.width, y: v * L.mask.height, sw };
+}
+
+function stamp(ctx, x, y, radius, soft, alpha, color) {
+  const inner = radius * clamp(1 - soft / 100, 0.02, 1);
+  const g = ctx.createRadialGradient(x, y, inner, x, y, Math.max(radius, inner + 0.5));
+  g.addColorStop(0, color.replace("ALPHA", alpha.toFixed(3)));
+  g.addColorStop(1, color.replace("ALPHA", "0"));
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.arc(x, y, Math.max(radius, inner + 0.5), 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function paintAt(L, from, to) {
+  const B = state.brush;
+  const target = B.tool === "fix" ? L.fix : L.mask;
+  const ctx = target.getContext("2d");
+  // Brush size is a share of the subject's own width, so it stays consistent
+  // whatever the subject is scaled to on screen.
+  const radius = Math.max(1, (B.size / 200) * L.mask.width);
+  const alpha = (B.strength / 100) * (B.tool === "fix" ? 0.35 : 0.5);
+  const color = B.tool === "erase" ? "rgba(0,0,0,ALPHA)" : "rgba(255,255,255,ALPHA)";
+
+  ctx.save();
+  if (B.tool === "fix") ctx.globalCompositeOperation = "lighter";
+  const dist = Math.hypot(to.x - from.x, to.y - from.y);
+  const steps = Math.max(1, Math.ceil(dist / (radius * 0.28)));
+  for (let i = 1; i <= steps; i++) {
+    const t = i / steps;
+    stamp(ctx, from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t, radius, B.soft, alpha, color);
+  }
+  ctx.restore();
+  L.maskRev++;
+  L._cache = null;
+}
+
+let painting = null;
+function startPaint(e) {
+  const L = state.scene.layers.find((x) => x.id === state.scene.selectedId);
+  if (!L) { toast("Pick a subject layer to paint on.", true); return; }
+  e.preventDefault();
+  const p = pointToMask(L, e.clientX, e.clientY);
+  painting = { L, last: p };
+  paintAt(L, p, p);
+  scheduleRender();
+  dom.layerOverlay.setPointerCapture?.(e.pointerId);
+  window.addEventListener("pointermove", movePaint);
+  window.addEventListener("pointerup", endPaint);
+}
+function movePaint(e) {
+  if (!painting) return;
+  e.preventDefault();
+  const p = pointToMask(painting.L, e.clientX, e.clientY);
+  paintAt(painting.L, painting.last, p);
+  painting.last = p;
+  scheduleRender();
+}
+function endPaint() {
+  painting = null;
+  window.removeEventListener("pointermove", movePaint);
+  window.removeEventListener("pointerup", endPaint);
+}
+
+function setBrush(on, tool) {
+  state.brush.on = on;
+  if (tool) state.brush.tool = tool;
+  dom.layerOverlay.classList.toggle("painting", on);
+  dom.sceneStage.classList.toggle("brush-mode", on);
+  renderHandles();
+  buildBrushBar();
+}
+
+async function runRefineHair(L) {
+  const R = state.scene.refine;
+  status("Refining the edge…");
+  await new Promise((r) => setTimeout(r, 16));
+  try {
+    // Refines from the CURRENT mask, so a rough hand-brushed fix is a valid
+    // input to it: block the edge in loosely, then let this solve the strands.
+    const out = refineHair(L.src, L.mask, R);
+    const m = cvOf(L.mask.width, L.mask.height);
+    m.getContext("2d").drawImage(out.mask, 0, 0, m.width, m.height);
+    L.mask = m;
+    L.decon = R.spill > 0 ? out.decon : null;
+    L.maskRev++;
+    L._cache = null;
+    scheduleRender();
+    status("Edge refined ✓ — brush over anything it missed.", "ok");
+    toast("✨ Hair & edges refined");
+  } catch (err) {
+    console.error(err);
+    status("Couldn't refine that edge.", "err");
   }
 }
 
@@ -1017,6 +1479,8 @@ function updateSceneButtons() {
   dom.sceneDownloadBtn.disabled = !hasScene;
   dom.beforeAfterBtn.disabled = !hasScene;
   dom.layerDeleteBtn.disabled = !state.scene.selectedId;
+  dom.brushToggle.disabled = !hasLayers;
+  if (!hasLayers && state.brush.on) setBrush(false);
   dom.layerFlattenReset.disabled = !hasLayers;
   dom.harmonizeBtn.disabled = !hasScene || !hasLayers;
   dom.mergeBtn.textContent = hasLayers || state.scene.overlay.img
@@ -1133,6 +1597,33 @@ function buildLayerStack() {
     body: (b) => { FINISH_ROWS.forEach((sp) => b.appendChild(sliderRow(sp, S.finish, rerender))); },
   }));
 
+  /* ✨ Glow specks */
+  host.appendChild(sectionCard({
+    key: "glow", icon: "🪰", title: "Glow specks",
+    meta: S.glow.count > 0 ? `${S.glow.count} lights` : "off",
+    visible: S.glow.visible,
+    onToggle: () => { S.glow.visible = !S.glow.visible; buildLayerStack(); rerender(); },
+    actions: btnRow([
+      ["🎲 Reshuffle", () => { S.glow.seed = Math.floor(Math.random() * 9999); rerender(); }],
+      ["🪰 30 fireflies", () => { Object.assign(S.glow, { visible: true, count: 30 }); buildLayerStack(); rerender(); }],
+      ["✕ None", () => { S.glow.count = 0; buildLayerStack(); rerender(); }],
+    ]),
+    body: (b) => {
+      const p = document.createElement("p");
+      p.className = "panel-hint"; p.style.margin = "2px 0 6px";
+      p.textContent = "Additive points of light — fireflies, embers, dust catching a lamp. Drawn, not pasted, so they glow into the scene instead of sitting on it.";
+      b.appendChild(p);
+      [
+        { k: "count",     label: "Count",      min: 0, max: 300 },
+        { k: "size",      label: "Size",       min: 2, max: 100 },
+        { k: "intensity", label: "Brightness", min: 0, max: 100 },
+        { k: "spread",    label: "Spread",     min: 5, max: 140 },
+        { k: "cy",        label: "Height",     min: 0, max: 100, hint: "where the swarm sits" },
+        { k: "hue",       label: "Colour",     min: 0, max: 359, unit: "°" },
+      ].forEach((sp) => b.appendChild(sliderRow(sp, S.glow, () => { buildBrushBar(); rerender(); })));
+    },
+  }));
+
   /* 🎞️ Overlay */
   host.appendChild(sectionCard({
     key: "overlay", icon: "🎞️", title: "Overlay", meta: S.overlay.img ? `${S.overlay.blend} · ${S.overlay.opacity}%` : "none",
@@ -1225,7 +1716,21 @@ function buildLayerStack() {
         })));
         b.appendChild(sliderRow({ k: "blur", label: "Blur", min: 0, max: 100, hint: "match scene focus" }, L.adj, () => { L._cache = null; rerender(); }));
         b.appendChild(sliderRow({ k: "grain", label: "Grain", min: 0, max: 100, hint: "match scene noise" }, L.adj, () => { L._cache = null; rerender(); }));
-        b.appendChild(groupLabel("Cut edge"));
+        b.appendChild(groupLabel("Cut edge & hair"));
+        b.appendChild(btnRow([
+          ["✨ Refine hair", () => runRefineHair(L), "Re-solve the edge against the photo's own background"],
+          ["✂️ Brush the mask", () => { S.selectedId = L.id; setBrush(true, "erase"); }],
+        ]));
+        const rf = document.createElement("p");
+        rf.className = "panel-hint dim"; rf.style.margin = "5px 0 0";
+        rf.textContent = "Refine estimates the local foreground and background colours around the edge and solves each pixel for how much of each it is — so strands come back as real partial alpha and the background spill causing a glowing rim gets un-mixed.";
+        b.appendChild(rf);
+        [
+          { k: "reach",    label: "Reach",     min: 5,  max: 100, hint: "how far out to look for strands" },
+          { k: "strength", label: "Strength",  min: 0,  max: 100 },
+          { k: "spill",    label: "De-spill",  min: 0,  max: 100, hint: "un-mix the old background colour" },
+        ].forEach((sp) => b.appendChild(sliderRow(sp, S.refine, () => {})));
+        b.appendChild(sliderRow({ k: "fixAmount", label: "Fix-light strength", min: 0, max: 100, hint: "for what you brush" }, L, () => { L._cache = null; rerender(); }));
         MATTE_ROWS.forEach((sp) => b.appendChild(sliderRow(sp, L.matte, () => { L._cache = null; rerender(); })));
         b.appendChild(groupLabel("Shadow"));
         const sw = document.createElement("label");
@@ -1292,11 +1797,84 @@ function applyLook(key) {
   if (look.overlay.blend) S.overlay.blend = look.overlay.blend;
   if (typeof look.overlay.opacity === "number") S.overlay.opacity = S.overlay.img ? look.overlay.opacity : 0;
   Object.assign(S.finish, look.finish);
-  S.look = key;
+  if (look.glow) Object.assign(S.glow, look.glow);
+  else { S.glow.visible = false; S.glow.count = 0; }
 
   buildLookChips(); buildLayerStack(); scheduleRender();
   status(`“${look.name}” applied — every slider below is now yours to tune.`, "ok");
   toast(`${look.icon} ${look.name} applied ✓`);
+}
+
+/* ---- Brush bar (sits under the stage while painting) ---- */
+function buildBrushBar() {
+  const bar = dom.brushBar;
+  bar.hidden = !state.brush.on;
+  dom.brushToggle.classList.toggle("active", state.brush.on);
+  if (!state.brush.on) return;
+  const B = state.brush;
+  const L = state.scene.layers.find((x) => x.id === state.scene.selectedId);
+  bar.innerHTML = "";
+
+  const tools = document.createElement("div");
+  tools.className = "brush-tools";
+  Object.entries(BRUSH_TOOLS).forEach(([k, t]) => {
+    const b = document.createElement("button");
+    b.className = "tool-btn" + (B.tool === k ? " active" : "");
+    b.textContent = `${t.icon} ${t.name}`;
+    b.title = t.hint;
+    b.addEventListener("click", () => { B.tool = k; buildBrushBar(); });
+    tools.appendChild(b);
+  });
+  bar.appendChild(tools);
+
+  const mini = (label, key, min, max) => {
+    const w = document.createElement("label");
+    w.className = "brush-slider";
+    w.innerHTML = `<span>${label} <b>${B[key]}</b></span>`;
+    const i = document.createElement("input");
+    i.type = "range"; i.min = min; i.max = max; i.value = B[key]; i.className = "srange";
+    i.addEventListener("input", () => { B[key] = Number(i.value); w.querySelector("b").textContent = i.value; });
+    w.appendChild(i);
+    return w;
+  };
+  const rows = document.createElement("div");
+  rows.className = "brush-rows";
+  rows.appendChild(mini("Size", "size", 1, 60));
+  rows.appendChild(mini("Soft", "soft", 0, 100));
+  rows.appendChild(mini("Strength", "strength", 5, 100));
+  bar.appendChild(rows);
+
+  const acts = document.createElement("div");
+  acts.className = "brush-tools";
+  const add = (label, fn, title) => {
+    const b = document.createElement("button");
+    b.className = "tool-btn tiny"; b.textContent = label; if (title) b.title = title;
+    b.addEventListener("click", fn); acts.appendChild(b);
+  };
+  if (L) {
+    add("✨ Refine hair", () => runRefineHair(L), "Re-solve the edge from the photo");
+    add("↺ Reset mask", async () => {
+      const asset = state.library.find((a) => a.id === L.assetId);
+      if (!asset) { toast("Original mask not in the Library any more.", true); return; }
+      const mi = await loadImage(asset.mask);
+      const m = cvOf(L.imgW, L.imgH);
+      m.getContext("2d").drawImage(mi, 0, 0, L.imgW, L.imgH);
+      L.mask = m; L.decon = null; L.maskRev++; L._cache = null;
+      scheduleRender(); toast("Mask reset to the original cut-out.");
+    });
+    add("○ Clear fix light", () => {
+      L.fix = cvOf(L.imgW, L.imgH); L.maskRev++; L._cache = null; scheduleRender();
+    });
+  }
+  add("✓ Done", () => setBrush(false));
+  bar.appendChild(acts);
+
+  const hint = document.createElement("p");
+  hint.className = "brush-hint";
+  hint.textContent = L
+    ? `Painting on “${L.name}”. ${BRUSH_TOOLS[B.tool].hint}.`
+    : "Select a subject in the Layers panel to paint on it.";
+  bar.appendChild(hint);
 }
 
 /* ---- Merge ---- */
@@ -1371,8 +1949,11 @@ function newSession() {
     layers: [],
     overlay: { dataUrl: null, img: null, visible: true, blend: "soft-light", opacity: 40, rot: 0, flipH: false, adj: newAdj() },
     finish: { visible: true, vignette: 0, grain: 0, fade: 0 },
+    glow: { visible: false, count: 0, size: 30, spread: 60, cy: 62, intensity: 65, hue: 68, seed: 7 },
+    refine: { reach: 45, strength: 80, spill: 80 },
     selectedId: null, zTop: 1, look: null,
   };
+  state.brush.on = false;
   dom.cutEmpty.hidden = false; dom.cutWrap.hidden = true;
   dom.cutSaveBtn.disabled = true; dom.cutDownloadBtn.disabled = true; dom.cutRunBtn.disabled = true;
   setCutTransformEnabled(false);
@@ -1387,8 +1968,8 @@ function newSession() {
    ============================================================ */
 const openPicker = (target) => { uploadTarget = target; dom.fileInput.click(); };
 
-function init() {
-  loadLibrary(); renderLibrary(); buildLookChips(); updateSceneButtons();
+async function init() {
+  await loadLibrary(); renderLibrary(); buildLookChips(); updateSceneButtons();
 
   document.querySelectorAll(".tab").forEach((t) => t.addEventListener("click", () => setTab(t.dataset.tab)));
 
@@ -1429,6 +2010,8 @@ function init() {
     buildLayerStack(); scheduleRender(); updateSceneButtons();
   });
   dom.sceneDownloadBtn.addEventListener("click", downloadScene);
+  dom.brushToggle.addEventListener("click", () => setBrush(!state.brush.on));
+  dom.layerOverlay.addEventListener("pointerdown", (e) => { if (state.brush.on) startPaint(e); });
   dom.copyPromptBtn.addEventListener("click", async () => {
     const ok = await copyText(RELIGHT_PROMPT);
     toast(ok ? "Relight prompt copied — paste it in the Gemini app with your image." : "Couldn't copy automatically.");
