@@ -98,7 +98,8 @@ const LOOKS = {
   },
   night: {
     name: "Night", icon: "🌙", match: 0.9,
-    base: { exposure: -46, contrast: 18, saturation: -34, temperature: -40, highlights: -26, shadows: -10 },
+    night: { visible: true, amount: 88, skyHue: 220, skyDark: 78, horizonGlow: 38, stars: 45, lampWarmth: 75 },
+    base: { contrast: 10, saturation: -18, highlights: -14 },
     subject: { exposure: -14, temperature: -12, saturation: -10 },
     overlay: { opacity: 18, blend: "soft-light", saturation: -40, exposure: -20 },
     finish: { vignette: 52, grain: 20, fade: 4 },
@@ -106,7 +107,8 @@ const LOOKS = {
   },
   fireflies: {
     name: "Fireflies", icon: "🪰", match: 0.9,
-    base: { exposure: -38, contrast: 14, saturation: -20, temperature: -28, highlights: -20 },
+    night: { visible: true, amount: 78, skyHue: 232, skyDark: 70, horizonGlow: 46, stars: 30, lampWarmth: 80 },
+    base: { contrast: 8, saturation: -12, highlights: -10 },
     subject: { exposure: -10, temperature: -8 },
     overlay: { opacity: 14, blend: "soft-light", saturation: -30, exposure: -18 },
     finish: { vignette: 46, grain: 16, fade: 6 },
@@ -133,6 +135,7 @@ const state = {
     overlay: { dataUrl: null, img: null, visible: true, blend: "soft-light", opacity: 40, rot: 0, flipH: false, adj: newAdj() },
     finish: { visible: true, vignette: 0, grain: 0, fade: 0 },
     glow: { visible: false, count: 0, size: 30, spread: 60, cy: 62, intensity: 65, hue: 68, seed: 7 },
+    night: { visible: false, amount: 0, skyHue: 220, skyDark: 78, skyDetail: 70, horizonGlow: 35, glowSide: 70, stars: 0, lampWarmth: 72, skyDetect: 50, skyFeather: 30, seed: 3 },
     selectedId: null, zTop: 1, look: null,
     refine: { reach: 45, strength: 80, spill: 80 },
   },
@@ -598,6 +601,224 @@ function refineHair(srcImg, maskSrc, { reach = 45, strength = 80, spill = 80 } =
   return { mask: outMask, decon: dec };
 }
 
+/* ============================================================
+   SKY DETECTION + REAL NIGHT
+
+   Grading a daytime frame darker does not make night — a blown-out sky
+   carries no detail, so darkening it only ever yields grey. Night needs
+   the sky found and *replaced*, and needs artificial light left behind
+   rather than dragged down with everything else.
+
+   Detection is a flood fill from the top edge that stops at strong
+   gradients. Sky is the region that is connected to the top of the
+   frame, close in colour to what's already up there, and not across a
+   hard edge — which is exactly what a roofline is.
+   ============================================================ */
+function detectSky(img, { threshold = 50, feather = 30 } = {}) {
+  const maxDim = 760;
+  const w0 = img.naturalWidth || img.width, h0 = img.naturalHeight || img.height;
+  const s = Math.min(1, maxDim / Math.max(w0, h0));
+  const W = Math.max(4, Math.round(w0 * s)), H = Math.max(4, Math.round(h0 * s));
+  const c = cvOf(W, H);
+  c.getContext("2d").drawImage(img, 0, 0, W, H);
+  const D = c.getContext("2d").getImageData(0, 0, W, H).data;
+  const N = W * H;
+
+  const lum = new Float32Array(N), sat = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    const j = i * 4, r = D[j] / 255, g = D[j + 1] / 255, b = D[j + 2] / 255;
+    lum[i] = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    sat[i] = Math.max(r, g, b) - Math.min(r, g, b);
+  }
+  // Sobel-ish gradient magnitude: the stop condition.
+  const grad = new Float32Array(N);
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      const i = y * W + x;
+      const gx = lum[i + 1] - lum[i - 1], gy = lum[i + W] - lum[i - W];
+      grad[i] = Math.hypot(gx, gy);
+    }
+  }
+
+  // Seed from the top strip, and take its colour as the sky reference.
+  const seedRows = Math.max(1, Math.round(H * 0.03));
+  let sl = 0, ss = 0, n = 0;
+  for (let y = 0; y < seedRows; y++) for (let x = 0; x < W; x++) { const i = y * W + x; sl += lum[i]; ss += sat[i]; n++; }
+  const refL = sl / n, refS = ss / n;
+
+  const tol = 0.10 + (threshold / 100) * 0.42;
+  const gStop = 0.055 + (1 - threshold / 100) * 0.05;
+
+  const inSky = new Uint8Array(N);
+  const q = [];
+  for (let y = 0; y < seedRows; y++) for (let x = 0; x < W; x++) { const i = y * W + x; inSky[i] = 1; q.push(i); }
+
+  while (q.length) {
+    const i = q.pop();
+    const x = i % W, y = (i / W) | 0;
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const nx = x + dx, ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+      const ni = ny * W + nx;
+      if (inSky[ni]) continue;
+      if (grad[ni] > gStop) continue;                       // don't cross a roofline
+      if (Math.abs(lum[ni] - refL) > tol) continue;
+      if (sat[ni] - refS > tol * 0.9) continue;             // sky stays unsaturated
+      inSky[ni] = 1; q.push(ni);
+    }
+  }
+
+  /* Power lines, aerials and bare branches are strong gradients, so the fill
+     stops dead at every one of them and leaves the sky sliced into strips —
+     which shows up as hard bands once the sky is re-lit. A morphological
+     close (dilate, then erode by the same amount) bridges anything thinner
+     than the radius while leaving the roofline where it is. The wires stay
+     visible either way: they're dark, and the sky remap preserves their own
+     luminance. */
+  const closeR = Math.max(2, Math.round(Math.min(W, H) / 90));
+  const dil = new Uint8Array(N), cls = new Uint8Array(N);
+  const morph = (src, dst, r, want) => {
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        let hit = 0;
+        for (let dy = -r; dy <= r && !hit; dy++) {
+          const yy = clamp(y + dy, 0, H - 1);
+          for (let dx = -r; dx <= r; dx++) {
+            if (src[yy * W + clamp(x + dx, 0, W - 1)] === want) { hit = 1; break; }
+          }
+        }
+        dst[y * W + x] = hit ? want : 1 - want;
+      }
+    }
+  };
+  morph(inSky, dil, closeR, 1);   // dilate
+  morph(dil, cls, closeR, 0);     // erode
+
+  const m = cvOf(W, H);
+  const mx = m.getContext("2d");
+  const id = mx.createImageData(W, H);
+  for (let i = 0; i < N; i++) {
+    const v = cls[i] ? 255 : 0;
+    id.data[i * 4] = id.data[i * 4 + 1] = id.data[i * 4 + 2] = v;
+    id.data[i * 4 + 3] = 255;
+  }
+  mx.putImageData(id, 0, 0);
+
+  const f = cvOf(W, H);
+  const fx = f.getContext("2d");
+  // Always soften a little: this mask gets scaled up many times over for a
+  // full-resolution export, and a hard low-res edge tears when it does.
+  fx.filter = `blur(${((feather / 100) * Math.min(W, H) / 40 + 1.1).toFixed(2)}px)`;
+  fx.drawImage(m, 0, 0);
+  return f;
+}
+
+/* Replace the sky, sink the ground into night, and leave artificial light
+   burning. One pass, so a lamp is only evaluated once. */
+function applyNight(id, W, H, skyData, N) {
+  const k = (N.amount || 0) / 100;
+  if (!k) return id;
+  const d = id.data;
+  const keep = (N.lampWarmth || 0) / 100;
+  const dark = (N.skyDark || 0) / 100;
+  const glow = (N.horizonGlow || 0) / 100;
+
+  // Find where the sky ends, so the gradient spans the sky rather than the frame.
+  let skyBottom = 0;
+  if (skyData) {
+    for (let y = H - 1; y >= 0; y--) {
+      let hit = 0;
+      for (let x = 0; x < W; x += Math.max(1, W >> 6)) if (skyData[(y * W + x) * 4] > 128) { hit++; break; }
+      if (hit) { skyBottom = y; break; }
+    }
+  }
+  skyBottom = Math.max(skyBottom, H * 0.12);
+
+  const hue = ((N.skyHue || 220) % 360) / 360;
+  const tint = hsl2rgb(hue, 0.45, 0.5);
+  const keepCloud = (N.skyDetail ?? 70) / 100;
+
+  /* Crucially the sky is re-exposed, not painted over. An overcast sky has
+     real cloud structure in it; replacing it with a flat gradient throws
+     that away and looks like a sticker. So we take the sky's OWN luminance,
+     normalise it against its own range, and remap that into a night range —
+     the clouds survive, they just live in the dark now. */
+  let sLo = 0, sHi = 1;
+  if (skyData) {
+    const samp = [];
+    const stride = Math.max(4, ((W * H) / 12000) | 0) * 4;
+    for (let i = 0; i < d.length; i += stride) {
+      if (skyData[i] > 140) samp.push(0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2]);
+    }
+    if (samp.length > 32) {
+      samp.sort((a, b) => a - b);
+      sLo = samp[(samp.length * 0.04) | 0] / 255;
+      sHi = samp[(samp.length * 0.97) | 0] / 255;
+      if (sHi - sLo < 0.02) { sLo = Math.max(0, sLo - 0.05); sHi = sLo + 0.1; }
+    }
+  }
+  const lo = 0.012 + (1 - dark) * 0.055;
+  const hi = 0.085 + (1 - dark) * 0.30;
+
+  for (let y = 0; y < H; y++) {
+    const t = clamp(y / skyBottom, 0, 1);
+    const vert = 0.62 + t * 0.62;               // zenith darker than horizon
+    for (let x = 0; x < W; x++) {
+      const i = (y * W + x) * 4;
+      let r = d[i] / 255, g = d[i + 1] / 255, b = d[i + 2] / 255;
+      const sky = skyData ? skyData[i] / 255 : 0;
+      const L = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+
+      let sr = 0, sg = 0, sb = 0;
+      if (sky > 0) {
+        const norm = clamp((L - sLo) / Math.max(0.02, sHi - sLo), 0, 1);
+        const shaped = 1 - Math.pow(1 - norm, 1 + keepCloud * 1.6);   // keep cloud separation
+        const nl = (lo + shaped * (hi - lo)) * vert;
+        sr = tint[0] * nl * 2.0; sg = tint[1] * nl * 2.0; sb = tint[2] * nl * 2.0;
+      }
+
+      // Ground: how lamp-like is this pixel? Warm and bright survives.
+      const warm = clamp((r - b) * 2.4, 0, 1) * clamp((L - 0.34) / 0.66, 0, 1);
+      const protect = warm * keep;
+      const kk = k * (1 - sky) * (1 - protect * 0.88);
+
+      if (kk > 0) {
+        const mul = 1 - kk * 0.74;
+        r *= mul; g *= mul; b *= mul;
+        const L2 = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        r += (L2 - r) * kk * 0.5;            // night vision desaturates…
+        g += (L2 - g) * kk * 0.5;
+        b += (L2 - b) * kk * 0.5;
+        b += kk * 0.055; r -= kk * 0.022;    // …and shifts blue
+      }
+      if (sky > 0) {
+        const ks = k * sky;
+        r += (sr - r) * ks; g += (sg - g) * ks; b += (sb - b) * ks;
+        if (glow) {
+          // Light pollution comes from somewhere, not from everywhere: bias it
+          // to one side and let it fall off, the way sodium glow really sits.
+          const side = (N.glowSide ?? 50) / 100;
+          const lateral = 1 - Math.abs(x / W - side) * 1.5;
+          const gl = glow * ks * Math.pow(t, 2.4) * clamp(lateral, 0, 1);
+          r += gl * 0.42; g += gl * 0.25; b += gl * 0.10;
+        }
+      }
+      d[i]     = r <= 0 ? 0 : r >= 1 ? 255 : r * 255;
+      d[i + 1] = g <= 0 ? 0 : g >= 1 ? 255 : g * 255;
+      d[i + 2] = b <= 0 ? 0 : b >= 1 ? 255 : b * 255;
+    }
+  }
+  return id;
+}
+
+function hsl2rgb(h, s, l) {
+  const f = (n) => {
+    const k = (n + h * 12) % 12;
+    return l - s * Math.min(l, 1 - l) * Math.max(-1, Math.min(k - 3, 9 - k, 1));
+  };
+  return [f(0), f(8), f(4)];
+}
+
 /* Local "fix light" paint — desaturate, cool and pull down the highlights
    only where the user has brushed. This is what kills a warm rim glow that
    belongs to the photo the subject came from. */
@@ -622,6 +843,39 @@ function applyLocalFix(id, fixData, amount) {
     d[i + 2] = clamp(b, 0, 1) * 255;
   }
   return id;
+}
+
+/* Sky detection is expensive, so it's cached against the image and the
+   detection settings — not against the grade, which doesn't move the sky. */
+function skyMask() {
+  const S = state.scene;
+  const sig = S.base.token + "|" + S.night.skyDetect + "|" + S.night.skyFeather;
+  if (S._sky && S._sky.sig === sig) return S._sky.canvas;
+  const canvas = detectSky(S.base.img, { threshold: S.night.skyDetect, feather: S.night.skyFeather });
+  S._sky = { sig, canvas };
+  return canvas;
+}
+function skyDataAt(W, H) {
+  const m = skyMask();
+  const c = cvOf(W, H);
+  c.getContext("2d").drawImage(m, 0, 0, W, H);
+  return c.getContext("2d").getImageData(0, 0, W, H).data;
+}
+function drawStars(ctx, W, H, N) {
+  const count = Math.round((N.stars / 100) * 1100);
+  if (!count) return;
+  const tmp = cvOf(W, H), tx = tmp.getContext("2d");
+  const rnd = mulberry32((N.seed | 0) * 40503 + 991);
+  for (let i = 0; i < count; i++) {
+    const x = rnd() * W, y = rnd() * H;
+    const b = 0.25 + rnd() * 0.75;
+    const r = Math.max(0.4, (Math.min(W, H) / 1400) * (0.5 + rnd() * 1.6));
+    tx.fillStyle = `rgba(255,255,${Math.round(232 + rnd() * 23)},${(b * 0.9).toFixed(3)})`;
+    tx.beginPath(); tx.arc(x, y, r, 0, Math.PI * 2); tx.fill();
+  }
+  tx.globalCompositeOperation = "destination-in";   // stars only in the sky
+  tx.drawImage(skyMask(), 0, 0, W, H);
+  ctx.save(); ctx.globalCompositeOperation = "lighter"; ctx.drawImage(tmp, 0, 0); ctx.restore();
 }
 
 /* Black silhouette of a sprite's alpha — the basis for both shadows. */
@@ -726,7 +980,11 @@ function renderComposite(targetW, opts = {}) {
   else {
     const id = ctx.getImageData(0, 0, W, H);
     applyAdjust(id, S.base.adj);
+    const NG = S.night;
+    const nightOn = NG.visible && NG.amount > 0;
+    if (nightOn) applyNight(id, W, H, skyDataAt(W, H), NG);
     ctx.putImageData(id, 0, 0);
+    if (nightOn && NG.stars > 0) drawStars(ctx, W, H, NG);
   }
 
   /* 2 — subject cutouts */
@@ -849,6 +1107,25 @@ function renderComposite(targetW, opts = {}) {
     ctx.restore();
   }
 
+  /* Sky mask inspector — draw it over everything so it can be judged */
+  if (S.showSky && S.base.img) {
+    ctx.save();
+    ctx.globalAlpha = 0.55;
+    ctx.globalCompositeOperation = "screen";
+    // The mask carries sky in its RGB with alpha opaque everywhere, so it has
+    // to be converted to alpha before it can tint anything.
+    const m = cvOf(W, H); const mx2 = m.getContext("2d");
+    mx2.drawImage(skyMask(), 0, 0, W, H);
+    const mid = mx2.getImageData(0, 0, W, H);
+    for (let i = 0; i < mid.data.length; i += 4) {
+      mid.data[i + 3] = mid.data[i];
+      mid.data[i] = 255; mid.data[i + 1] = 59; mid.data[i + 2] = 127;
+    }
+    mx2.putImageData(mid, 0, 0);
+    ctx.drawImage(m, 0, 0);
+    ctx.restore();
+  }
+
   /* 5 — finish */
   const F = S.finish;
   if (F.visible) {
@@ -946,7 +1223,7 @@ function sceneRectFor(L, W, H) {
    from under the subject. */
 function baseAnalysis() {
   const S = state.scene;
-  const sig = S.base.token + "|" + JSON.stringify(S.base.adj);
+  const sig = S.base.token + "|" + JSON.stringify(S.base.adj) + "|" + JSON.stringify(S.night);
   if (S._an && S._an.sig === sig) return S._an;
   const W = 640, H = Math.max(1, Math.round(W * (S.base.img.naturalHeight / S.base.img.naturalWidth)));
   const c = cvOf(W, H);
@@ -954,6 +1231,9 @@ function baseAnalysis() {
   x.drawImage(S.base.img, 0, 0, W, H);
   const id = x.getImageData(0, 0, W, H);
   applyAdjust(id, S.base.adj);
+  // Night moves the scene as surely as the grade does, so a subject that
+  // follows the scene has to be matched against the night version of it.
+  if (S.night.visible && S.night.amount > 0) applyNight(id, W, H, skyDataAt(W, H), S.night);
   S._an = { sig, W, H, data: id.data };
   return S._an;
 }
@@ -1688,6 +1968,42 @@ function buildLayerStack() {
     body: (b) => { FINISH_ROWS.forEach((sp) => b.appendChild(sliderRow(sp, S.finish, rerender))); },
   }));
 
+  /* 🌙 Night */
+  host.appendChild(sectionCard({
+    key: "night", icon: "🌙", title: "Night",
+    meta: S.night.visible && S.night.amount > 0 ? `${S.night.amount}%` : "off",
+    visible: S.night.visible,
+    onToggle: () => { S.night.visible = !S.night.visible; S._an = null; autoMatchAll(); buildLayerStack(); rerender(); },
+    actions: btnRow([
+      ["🌙 Full night", () => { Object.assign(S.night, { visible: true, amount: 88, stars: 45 }); S._an = null; autoMatchAll(); buildLayerStack(); rerender(); }],
+      ["🌆 Dusk", () => { Object.assign(S.night, { visible: true, amount: 52, stars: 12 }); S._an = null; autoMatchAll(); buildLayerStack(); rerender(); }],
+      ["👁 Show sky mask", () => { S.showSky = !S.showSky; rerender(); }, "Check what was detected as sky"],
+      ["✕ Off", () => { S.night.visible = false; S.night.amount = 0; S._an = null; autoMatchAll(); buildLayerStack(); rerender(); }],
+    ]),
+    body: (b) => {
+      const p = document.createElement("p");
+      p.className = "panel-hint"; p.style.margin = "2px 0 6px";
+      p.textContent = "Darkening a daytime frame only makes it grey — a blown sky has no detail to recover. This finds the sky and replaces it, sinks the ground into night, and leaves warm artificial light burning.";
+      b.appendChild(p);
+      const nightChange = () => { S._an = null; if (autoMatchAll()) syncSliders(); buildBrushBar(); rerender(); };
+      [
+        { k: "amount",      label: "Night",        min: 0, max: 100 },
+        { k: "skyDark",     label: "Sky darkness", min: 0, max: 100 },
+        { k: "skyHue",      label: "Sky colour",   min: 0, max: 359, unit: "°" },
+        { k: "skyDetail",   label: "Cloud detail", min: 0, max: 100, hint: "keeps the sky's own structure" },
+        { k: "horizonGlow", label: "City glow",    min: 0, max: 100, hint: "sodium light pollution" },
+        { k: "glowSide",    label: "Glow from",    min: 0, max: 100, hint: "left ↔ right" },
+        { k: "stars",       label: "Stars",        min: 0, max: 100 },
+        { k: "lampWarmth",  label: "Keep lamps lit", min: 0, max: 100, hint: "protects warm light" },
+      ].forEach((sp) => b.appendChild(sliderRow(sp, S.night, nightChange)));
+      b.appendChild(groupLabel("Sky detection"));
+      [
+        { k: "skyDetect",  label: "Spread",  min: 0, max: 100, hint: "how far the fill runs" },
+        { k: "skyFeather", label: "Softness", min: 0, max: 100 },
+      ].forEach((sp) => b.appendChild(sliderRow(sp, S.night, () => { S._sky = null; nightChange(); })));
+    },
+  }));
+
   /* ✨ Glow specks */
   host.appendChild(sectionCard({
     key: "glow", icon: "🪰", title: "Glow specks",
@@ -1890,6 +2206,9 @@ function applyLook(key) {
   Object.assign(S.finish, look.finish);
   if (look.glow) Object.assign(S.glow, look.glow);
   else { S.glow.visible = false; S.glow.count = 0; }
+  if (look.night) Object.assign(S.night, look.night);
+  else { S.night.visible = false; S.night.amount = 0; }
+  S._an = null;
 
   buildLookChips(); buildLayerStack(); scheduleRender();
   status(`“${look.name}” applied — every slider below is now yours to tune.`, "ok");
@@ -2054,6 +2373,7 @@ function newSession() {
     overlay: { dataUrl: null, img: null, visible: true, blend: "soft-light", opacity: 40, rot: 0, flipH: false, adj: newAdj() },
     finish: { visible: true, vignette: 0, grain: 0, fade: 0 },
     glow: { visible: false, count: 0, size: 30, spread: 60, cy: 62, intensity: 65, hue: 68, seed: 7 },
+    night: { visible: false, amount: 0, skyHue: 220, skyDark: 78, skyDetail: 70, horizonGlow: 35, glowSide: 70, stars: 0, lampWarmth: 72, skyDetect: 50, skyFeather: 30, seed: 3 },
     refine: { reach: 45, strength: 80, spill: 80 },
     selectedId: null, zTop: 1, look: null,
   };
