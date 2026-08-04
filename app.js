@@ -1172,6 +1172,42 @@ function skyDataAt(W, H) {
   // partially treated as ground, which reads as a dark halo hugging every
   // building. Steepening the ramp about its midpoint keeps the sub-pixel
   // edge the guide found while collapsing the transition to a few pixels.
+  /* Appearance gate. Pushing the unknown band past the roofline is what
+     stops sky being left on the ground side, but it also hands the solver a
+     strip of building to decide about — and it was claiming some of it
+     outright, measured at 4.7% of the brickwork with individual pixels fully
+     opaque. Geometry alone cannot settle this: a pixel adjacent to sky is
+     not sky if it looks nothing like it.
+
+     So gate the solve on how far each pixel sits from the colour of the sky
+     that was confidently found. Brickwork is many deviations away and gets
+     rejected regardless of where the band reached. */
+  let mr = 0, mg = 0, mb = 0, sn2 = 0;
+  for (let i = 0; i < n; i++) {
+    if (sure[i] !== 1) continue;
+    const j = i * 4;
+    mr += gd[j]; mg += gd[j + 1]; mb += gd[j + 2]; sn2++;
+  }
+  let gate = null;
+  if (sn2 > 40) {
+    mr /= sn2; mg /= sn2; mb /= sn2;
+    let vv = 0;
+    for (let i = 0; i < n; i++) {
+      if (sure[i] !== 1) continue;
+      const j = i * 4;
+      const dr = gd[j] - mr, dg2 = gd[j + 1] - mg, db = gd[j + 2] - mb;
+      vv += dr * dr + dg2 * dg2 + db * db;
+    }
+    const sd2 = Math.max(9, Math.sqrt(vv / sn2));
+    gate = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const j = i * 4;
+      const dr = gd[j] - mr, dg2 = gd[j + 1] - mg, db = gd[j + 2] - mb;
+      const dist = Math.sqrt(dr * dr + dg2 * dg2 + db * db) / sd2;
+      gate[i] = clamp((3.2 - dist) / 1.6, 0, 1);      // within ~1.6σ keep, past ~3.2σ drop
+    }
+  }
+
   // Known regions are known: pin them, and let the solve stand only in the
   // unknown band. This is what stops the matte drifting off real edges.
   const bw = 0.07 + (1 - edge) * 0.33;
@@ -1181,6 +1217,7 @@ function skyDataAt(W, H) {
     if (sure[i] === 2) { q[i] = 0; continue; }
     const t = clamp((q[i] - lo) / span, 0, 1);
     q[i] = t * t * (3 - 2 * t);
+    if (gate) q[i] *= gate[i];          // geometry proposes, appearance disposes
   }
 
   const out = cvOf(w, h);
