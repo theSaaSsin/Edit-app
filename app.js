@@ -650,27 +650,39 @@ function detectSky(img, { threshold = 50, feather = 30 } = {}) {
   for (let y = 0; y < seedRows; y++) for (let x = 0; x < W; x++) { const i = y * W + x; sl += lum[i]; ss += sat[i]; n++; }
   const refL = sl / n, refS = ss / n;
 
+  /* Two fills, not one. A single tolerance has to be either strict — which
+     stops short of rooflines and leaves sky misclassified — or loose, which
+     leaks through gaps into the buildings. Running both gives the bounds
+     directly from the image instead of guessing them with a fixed
+     morphological radius: what the strict fill reaches is certainly sky,
+     what the loose fill cannot reach is certainly not, and the guided filter
+     resolves the band between against the photograph. */
+  const fill = (tol, gStop) => {
+    const hit = new Uint8Array(N);
+    const q = [];
+    for (let y = 0; y < seedRows; y++) for (let x = 0; x < W; x++) { const i = y * W + x; hit[i] = 1; q.push(i); }
+    while (q.length) {
+      const i = q.pop();
+      const x = i % W, y = (i / W) | 0;
+      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const nx = x + dx, ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+        const ni = ny * W + nx;
+        if (hit[ni]) continue;
+        if (grad[ni] > gStop) continue;                     // don't cross a roofline
+        if (Math.abs(lum[ni] - refL) > tol) continue;
+        if (sat[ni] - refS > tol * 0.9) continue;
+        hit[ni] = 1; q.push(ni);
+      }
+    }
+    return hit;
+  };
+
   const tol = 0.10 + (threshold / 100) * 0.42;
   const gStop = 0.055 + (1 - threshold / 100) * 0.05;
-
-  const inSky = new Uint8Array(N);
-  const q = [];
-  for (let y = 0; y < seedRows; y++) for (let x = 0; x < W; x++) { const i = y * W + x; inSky[i] = 1; q.push(i); }
-
-  while (q.length) {
-    const i = q.pop();
-    const x = i % W, y = (i / W) | 0;
-    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
-      const nx = x + dx, ny = y + dy;
-      if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
-      const ni = ny * W + nx;
-      if (inSky[ni]) continue;
-      if (grad[ni] > gStop) continue;                       // don't cross a roofline
-      if (Math.abs(lum[ni] - refL) > tol) continue;
-      if (sat[ni] - refS > tol * 0.9) continue;             // sky stays unsaturated
-      inSky[ni] = 1; q.push(ni);
-    }
-  }
+  const tight = fill(tol * 0.80, gStop * 0.80);             // certainly sky
+  const loose = fill(tol * 1.30, gStop * 1.45);             // certainly not, beyond this
+  const inSky = fill(tol, gStop);                           // the working estimate
 
   /* Power lines, aerials and bare branches are strong gradients, so the fill
      stops dead at every one of them and leaves the sky sliced into strips —
@@ -680,7 +692,7 @@ function detectSky(img, { threshold = 50, feather = 30 } = {}) {
      visible either way: they're dark, and the sky remap preserves their own
      luminance. */
   const closeR = Math.max(2, Math.round(Math.min(W, H) / 90));
-  const dil = new Uint8Array(N), cls = new Uint8Array(N);
+  const dil = new Uint8Array(N), cls = new Uint8Array(N), tmpA = new Uint8Array(N);
   const morph = (src, dst, r, want) => {
     for (let y = 0; y < H; y++) {
       for (let x = 0; x < W; x++) {
@@ -707,23 +719,53 @@ function detectSky(img, { threshold = 50, feather = 30 } = {}) {
      sky, dilated region is confidently not, and the band between is unknown.
      The guided filter resolves the unknown band against the photograph, the
      way the hair matte does. Nothing here is tuned to one image. */
-  // Asymmetric on purpose: trust the interior almost to the fill's own edge,
-  // and push the "might be sky" region well past it. The fill stops short of
-  // rooflines, so the unknown band has to sit OUTSIDE the boundary for the
-  // guided filter to find the real edge inside it.
-  const inR = Math.max(1, Math.round(closeR * 0.35));
-  const outR = Math.max(3, Math.round(closeR * 2.0));
+  /* Bounds come from the two fills. Morphology is still applied, but only to
+     close thin structures (wires, aerials) inside each bound — it no longer
+     has to invent where the edge might be, which is what made a fixed radius
+     right on one photograph and wrong on the next. */
   const sure = new Uint8Array(N), maybe = new Uint8Array(N);
-  morph(cls, sure, inR, 0);       // erode a little -> confidently sky
-  morph(cls, maybe, outR, 1);     // dilate a lot   -> beyond this, not sky
+  const tclose = new Uint8Array(N), lclose = new Uint8Array(N);
+  morph(tight, tmpA, closeR, 1); morph(tmpA, tclose, closeR, 0);
+  morph(loose, tmpA, closeR, 1); morph(tmpA, lclose, closeR, 0);
+  /* The loose fill can still run away on a scene with a soft horizon, and an
+     unknown band covering half the frame lets the guided filter invent sky
+     wherever it likes — measured at roughly double the working estimate on
+     every test scene. Bound the band spatially as well: it may only extend a
+     short distance from what the working fill actually reached. */
+  const over = new Uint8Array(N);
+  morph(cls, tmpA, Math.max(2, Math.round(closeR * 1.6)), 1);
+  for (let i = 0; i < N; i++) over[i] = tmpA[i];
 
-  // 255 = sure sky, 0 = sure not-sky, 128 = unknown, resolved downstream.
+  const reach = new Uint8Array(N);
+  morph(cls, tmpA, Math.max(3, closeR * 3), 1);
+  for (let i = 0; i < N; i++) reach[i] = tmpA[i];
+  /* A strict fill cannot traverse a highly varied sky — on a sunset it barely
+     moves, which left "sure" tiny and let the guided filter shrink an
+     86%-sky frame to half that. The working fill's own interior is the
+     dependable floor; the strict fill only adds to it. */
+  const interior = new Uint8Array(N);
+  morph(cls, tmpA, Math.max(2, Math.round(closeR * 1.8)), 0);
+  for (let i = 0; i < N; i++) interior[i] = tmpA[i];
+  for (let i = 0; i < N; i++) {
+    sure[i] = (interior[i] || (tclose[i] && cls[i])) ? 1 : 0; // sure ⊆ working
+    // The loose fill halts on the same roofline gradient the strict one does,
+    // just later — so on its own it never covers the pixels between the
+    // fill's edge and the real edge, and they get pinned to not-sky and
+    // survive as the bright fringe. The dilation has to be part of the bound.
+    maybe[i] = ((lclose[i] || cls[i] || over[i]) && reach[i]) ? 1 : 0;
+  }
+
+  /* 255 sure sky · 0 sure not · 170/90 unknown, leaning sky / leaning ground.
+     The lean is what matters: the fill stops before the roofline, so the
+     pixels between are unknown but almost certainly sky, and saying so lets
+     the guided filter snap the edge back onto the building instead of
+     resolving them to ground. */
   const m = cvOf(W, H);
   const mx = m.getContext("2d");
   const id = mx.createImageData(W, H);
   let skyN = 0;
   for (let i = 0; i < N; i++) {
-    const v = sure[i] ? 255 : (maybe[i] ? 128 : 0);
+    const v = sure[i] ? 255 : (maybe[i] ? (over[i] ? 170 : 90) : 0);
     if (cls[i]) skyN++;
     id.data[i * 4] = id.data[i * 4 + 1] = id.data[i * 4 + 2] = v;
     id.data[i * 4 + 3] = 255;
@@ -1120,7 +1162,7 @@ function skyDataAt(W, H) {
     guide[i] = (0.2126 * gd[j] + 0.7152 * gd[j + 1] + 0.0722 * gd[j + 2]) / 255;
     const v = md[j];
     sure[i] = v > 200 ? 1 : (v < 55 ? 2 : 0);
-    mask[i] = v > 200 ? 1 : (v < 55 ? 0 : 0.5);
+    mask[i] = v > 200 ? 1 : (v < 55 ? 0 : (v > 128 ? 0.80 : 0.28));
   }
   const edge = (S.night.skyEdge ?? 70) / 100;
   const r = Math.max(2, Math.round((1.6 + (1 - edge) * 9) * Math.min(w, h) / 380));
