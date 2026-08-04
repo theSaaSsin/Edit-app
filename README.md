@@ -1,19 +1,57 @@
-# 🎨 Claude Photo Studio — Free Cut-Out & Scene Compositor
+# 🎨 Claude Photo Studio — Cut Out, Compose &amp; Harmonize
 
-Build scenes from cut-out items — **100% free, runs entirely in your browser.** No account, no API key, no quota. Your photos never leave your device.
+Drop a person into a scene and make them **belong** there — **100% free, runs entirely in your browser.** No account, no API key, no quota. Your photos never leave your device.
 
-- **✂️ Cut Out** — add a photo of an outfit piece, furniture, graffiti — anything with a clear subject — and an on-device model erases the background, leaving a transparent cutout. Save cutouts to your **Library**.
-- **🎬 Scene** — set a base image (a character, a room, a wall), **tap Library cutouts to drop them in**, then **move / resize / rotate** each one. Turn on **cast shadows** (with adjustable light direction), pick a **color grade**, and **Merge** to flatten it into a finished image with a full undo history.
+The whole app is a three-part layer stack rendered by one pipeline:
 
-## The workflow (free end-to-end)
+```
+✨ Finish    vignette · grain · faded blacks
+🎞️ Overlay   texture photo + blend mode        ← the "feel"
+🧍 Subject   cutouts: light, colour, matte, shadows
+🖼️ Scene     the main image
+```
 
-This app is deliberately the **front half** of a free pipeline:
+Every layer has an **eye toggle** and its own sliders. **Auto edits** set the whole stack in one tap, then you tune anything.
 
-1. **Cut out & compose here** — precise placement, scaling, rotation, shadows, and grading. (This is exactly what AI image apps are *bad* at.)
-2. **Download** the composite PNG.
-3. Open the **free Gemini app** on your phone (or gemini.google.com), add the image, and paste the built-in **relight prompt** (there's a *Copy relight prompt* button). Nano-banana relights it into one photorealistic scene.
+## The three images
 
-> **Why this is free:** the daily quota you can hit is on the *developer API key*. The **Gemini app** has its own separate free image editing — so relighting there doesn't touch that quota. And the cut-out + compositing in this app use **no API at all**; they run locally with the Canvas API and an on-device background-removal model.
+1. **Main image** — the location. *Compose → ＋ Main image.*
+2. **Subject** — a photo of a person or object. *Cut Out → Remove background → 💾 Add to Library →* then tap it in Compose to drop it in.
+3. **Overlay** — a texture photo (rust, grain, a light leak, a painted wall). *Compose → 🎞️ Overlay.*
+
+## Harmonizing — the part that makes it look real
+
+A subject shot at golden hour dropped into an overcast yard reads as pasted on. **🎯 Match subject to the scene** fixes that automatically:
+
+- it samples the main image **in the region where the subject is standing** (a subject in shade should match the shade, not the whole frame),
+- samples the subject's own opaque pixels,
+- and inverts each adjustment's model to solve for the **exposure, contrast, temperature, tint and saturation** that close the gap.
+
+It runs automatically when you place a cutout, and the numbers land in the sliders — so it's a starting point you can *work off*, not a black box. Then, per subject:
+
+| Control | What it fixes |
+| --- | --- |
+| **Shrink edge** | eats the halo of old background left around the cut |
+| **Soften edge** | feathers a matte that's too crisp for the scene |
+| **Darken edge** | kills bright fringing — the biggest "pasted on" tell |
+| **Blur** / **Grain** | match the scene's focus and noise |
+| **Contact shadow** | grounds the subject at its feet so it isn't floating |
+| **Cast shadow** | angle, length, softness, strength |
+
+The contact shadow is placed from the sprite's **opaque bounding box**, so it sits at the subject's actual feet, not at the bottom of a mostly-empty PNG.
+
+## Auto edits
+
+Each look **harmonizes the subject to the scene first**, then applies a creative offset across all layers — so the presets stay scene-aware instead of stamping fixed numbers on top.
+
+| | |
+| --- | --- |
+| 🎯 **Auto blend** | pure harmonization, minimal grade |
+| 🧱 **Rust & ruin** | leans into warm oxidised textures, soft-light overlay |
+| 🌅 **Golden hour** | warm, lifted shadows, screen overlay |
+| 🧊 **Cold concrete** | cool, desaturated, heavy vignette |
+| 🎞️ **Bleach film** | crushed saturation, lifted blacks, grain |
+| ⚫ **Ink noir** | black & white, hard contrast |
 
 ## Use it on your phone
 
@@ -21,35 +59,30 @@ Hosted straight from GitHub, nothing to install:
 
 **https://raw.githack.com/theSaaSsin/Edit-app/main/index.html**
 
-## Workflow details
+## Preview = export
 
-**Make cutouts (Cut Out tab)**
-1. **Choose a photo** with a clear main subject.
-2. Tap **✂️ Remove background** (first run downloads a small model once, then it's cached/offline).
-3. **💾 Add to Library.** Repeat to stock up on garments, furniture, graffiti, etc.
-   *To isolate one thing like a jacket, photograph or crop it on its own — free removal keeps the whole foreground subject and can't pick one object out of a busy photo.*
+`renderComposite()` draws both the live preview (downscaled to fit the stage) and the exported PNG (at the main image's full resolution). There is no second code path, so what you see is what downloads.
 
-**Compose a scene (Scene tab)**
-1. **Choose scene photo** (character / room / wall).
-2. **Tap a Library cutout** to drop it in.
-3. **Drag** to move · **corner handle** to resize · **top handle** to rotate · **✕** to delete. Add more and arrange.
-4. Toggle **Cast shadows** and set **Light from**; pick a **Color grade**.
-5. **🧩 Merge** to bake shadows + grade into a new scene version (keep compositing on top), or **⬇ Download** any time.
-6. For photorealism, hand the download to the **Gemini app** with the copied relight prompt.
+**🧩 Merge** bakes the current stack into a new scene version you can keep composing on top of, with a full history strip. **⬇ Download** exports without merging. **👁 Before** is hold-to-compare against the untouched main image.
 
-Your **Library persists** in the browser between visits. **New** clears the current scene/cut-out but keeps the Library.
+Your **Library persists** in the browser between visits. **↺ New** clears the scene and cut-out but keeps the Library.
 
 ## Files
 
 ```
-index.html   — tabs, cut-out & scene stages, library, panels, help
-styles.css   — dark responsive UI, transparency checkerboard, layer handles, shadow preview
+index.html   — tabs, cut-out & compose stages, library, layer panel, help
+styles.css   — dark responsive UI, transparency checkerboard, layer cards & sliders
 app.js       — on-device background removal (@imgly/background-removal),
-               library, scene layers (drag/resize/rotate), canvas shadows,
-               color grades, flatten/merge, history, relight-prompt handoff
+               pixel engine (tone/colour/matte/shadows/blend/finish),
+               scene→subject harmonizer, auto edits, one renderer for
+               preview + export, history
 ```
 
-No build step. The only runtime dependency is the background-removal model, loaded on demand from a public CDN and cached.
+No build step. The only runtime dependency is the background-removal model, loaded on demand from a public CDN and cached — after that first load the app works offline.
+
+## Optional: photorealistic relighting
+
+Compositing precisely is exactly what AI image apps are bad at, and relighting is what they're good at. So: compose and harmonize here → **Download** → open the free **Gemini app**, add the image, and paste the built-in **relight prompt** (there's a *Copy relight prompt* button). That app's image editing is free and separate from the developer API quota.
 
 ## Privacy
 

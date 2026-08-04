@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Claude Photo Studio — Free Cut-Out &amp; Scene Compositor</title>
-  <meta name="description" content="Cut out items in your browser (free, no account), build a library, then drop them into a scene with shadows and color grading. 100% client-side." />
+  <title>Claude Photo Studio — Cut-Out, Compose &amp; Harmonize</title>
+  <meta name="description" content="Cut out a subject in your browser, drop it into a scene, harmonize it to the scene's light and colour, then finish with a texture overlay. 100% client-side." />
   <link rel="stylesheet" href="styles.css" />
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8E%A8%3C/text%3E%3C/svg%3E" />
 </head>
@@ -25,7 +25,7 @@
 
   <nav class="tabs">
     <button class="tab active" data-tab="cut">✂️ Cut Out</button>
-    <button class="tab" data-tab="scene">🎬 Scene</button>
+    <button class="tab" data-tab="scene">🎬 Compose</button>
   </nav>
 
   <main class="workspace">
@@ -35,10 +35,10 @@
       <div id="cutStage" class="stage-canvas checker" tabindex="0">
         <div id="cutEmpty" class="empty-state">
           <div class="empty-icon">✂️</div>
-          <h2>Cut out an item</h2>
-          <p>Add a photo of an outfit piece, furniture, graffiti — anything with a clear subject. I'll erase the background right here on your device.</p>
+          <h2>Cut out your subject</h2>
+          <p>Add a photo of a person, an outfit piece, furniture — anything with a clear subject. The background is erased right here on your device.</p>
           <button id="cutUploadTrigger" class="btn btn-primary">Choose a photo</button>
-          <p class="empty-hint">Free &amp; unlimited. Best results: the item is the clear main thing in the photo.</p>
+          <p class="empty-hint">Free &amp; unlimited. Straighten a sideways phone photo with the rotate buttons before cutting.</p>
         </div>
         <div id="cutWrap" class="preview-wrap" hidden>
           <img id="cutImg" class="preview-img" alt="Item" />
@@ -51,11 +51,11 @@
         <div id="sceneEmpty" class="empty-state">
           <div class="empty-icon">🎬</div>
           <h2>Set your scene</h2>
-          <p>Add the base image — a character, a room, a wall — then drop cutouts from your Library onto it.</p>
-          <button id="sceneUploadTrigger" class="btn btn-primary">Choose scene photo</button>
+          <p>Add the main image — the location or backdrop. Then drop in your cut-out subject and a texture overlay on top.</p>
+          <button id="sceneUploadTrigger" class="btn btn-primary">Choose main image</button>
         </div>
         <div id="sceneWrap" class="preview-wrap" hidden>
-          <img id="sceneImg" class="preview-img" alt="Scene" />
+          <canvas id="sceneCanvas" class="preview-img"></canvas>
           <div id="layerOverlay" class="layer-overlay"></div>
         </div>
       </div>
@@ -63,15 +63,20 @@
       <div class="stage-toolbar">
         <div id="cutToolbar" class="toolbar-row">
           <button id="cutAddBtn" class="tool-btn" title="Add / replace the item photo">＋ Photo</button>
+          <button id="cutRotL" class="tool-btn" title="Rotate left" disabled>⟲</button>
+          <button id="cutRotR" class="tool-btn" title="Rotate right" disabled>⟳</button>
+          <button id="cutFlip" class="tool-btn" title="Flip horizontally" disabled>⇋</button>
           <span class="tool-sep"></span>
           <button id="cutSaveBtn" class="tool-btn" title="Save this cutout to your Library" disabled>💾 Add to Library</button>
           <button id="cutDownloadBtn" class="tool-btn" title="Download cutout PNG" disabled>⬇ PNG</button>
         </div>
         <div id="sceneToolbar" class="toolbar-row" hidden>
-          <button id="sceneAddBtn" class="tool-btn" title="Change scene photo">＋ Scene</button>
-          <button id="layerDeleteBtn" class="tool-btn" title="Delete selected item" disabled>🗑 Delete item</button>
+          <button id="sceneAddBtn" class="tool-btn" title="Change the main image">＋ Main image</button>
+          <button id="overlayAddBtn" class="tool-btn" title="Add a texture / filter overlay">🎞️ Overlay</button>
+          <button id="layerDeleteBtn" class="tool-btn" title="Delete selected item" disabled>🗑 Delete</button>
           <button id="layerFlattenReset" class="tool-btn" title="Remove all placed items" disabled>✕ Clear items</button>
           <span class="tool-sep"></span>
+          <button id="beforeAfterBtn" class="tool-btn" title="Hold to see the untouched main image" disabled>👁 Before</button>
           <button id="sceneDownloadBtn" class="tool-btn" title="Download current scene" disabled>⬇ Download</button>
         </div>
       </div>
@@ -102,41 +107,24 @@
       <!-- Scene panel -->
       <div id="scenePanel" class="panel" hidden>
         <div class="control-block">
-          <label class="switch"><input type="checkbox" id="shadowToggle" checked /><span>Cast shadows under items</span></label>
-          <div class="row">
-            <span class="mini-label">Light from</span>
-            <select id="lightDir" class="mini-select">
-              <option value="tl">↖ Top-left</option>
-              <option value="tr">↗ Top-right</option>
-              <option value="t">↑ Top</option>
-              <option value="bl">↙ Bottom-left</option>
-              <option value="br">↘ Bottom-right</option>
-            </select>
-          </div>
+          <span class="field-label">✨ Auto edits <em>(a starting point — tweak everything after)</em></span>
+          <div class="quick-actions" id="lookChips"></div>
+          <button id="harmonizeBtn" class="btn btn-ghost block" disabled>🎯 Match subject to the scene</button>
+          <p class="panel-hint dim" style="margin:8px 0 0">Reads the light and colour of the main image where your subject sits, and dials the subject's exposure, contrast, temperature and tint to match.</p>
         </div>
 
-        <div class="control-block">
-          <span class="field-label">Color grade <em>(whole scene)</em></span>
-          <div class="quick-actions" id="gradeChips">
-            <button class="chip active" data-grade="none">None</button>
-            <button class="chip" data-grade="warm">🌅 Warm</button>
-            <button class="chip" data-grade="cinematic">🎞️ Cinematic</button>
-            <button class="chip" data-grade="cool">❄️ Cool</button>
-            <button class="chip" data-grade="bw">⚫ B&amp;W</button>
-            <button class="chip" data-grade="vivid">🌈 Vivid</button>
-          </div>
-        </div>
+        <span class="field-label">🧱 Layers <em>(top to bottom)</em></span>
+        <div id="layerStack" class="layer-stack"></div>
 
-        <button id="mergeBtn" class="btn btn-primary block" disabled>🧩 Merge items &amp; bake grade</button>
+        <button id="mergeBtn" class="btn btn-primary block" disabled>🧩 Merge &amp; bake into a new version</button>
 
         <div class="handoff">
           <p class="handoff-title">✨ Want photorealistic relighting?</p>
-          <p class="handoff-text">Build &amp; arrange here → <strong>Download</strong> → open the free <strong>Gemini app</strong> on your phone, add the image, and paste this:</p>
+          <p class="handoff-text">Compose &amp; harmonize here → <strong>Download</strong> → open the free <strong>Gemini app</strong>, add the image, and paste this:</p>
           <button id="copyPromptBtn" class="btn btn-ghost block">📋 Copy relight prompt</button>
           <p class="handoff-note">The Gemini app's image editing is free and separate from the API quota.</p>
         </div>
 
-        <p class="panel-hint">Tap a Library cutout to place it, then drag to move, use the corner to resize and the top handle to rotate. Merging flattens everything (with shadows &amp; grade) into a new scene version you can keep building on.</p>
         <div id="statusMsg" class="status"></div>
       </div>
     </section>
@@ -147,13 +135,14 @@
     <div class="modal-card">
       <button class="modal-close" id="helpClose" aria-label="Close">✕</button>
       <h2>How it works</h2>
-      <p class="modal-lead">This app is <strong>completely free</strong> and runs entirely in your browser — there's no account, no API key, and no usage limits.</p>
+      <p class="modal-lead">Three layers, stacked. Everything is <strong>free</strong> and runs entirely in your browser — no account, no API key, no limits.</p>
       <ul class="help-list">
-        <li><strong>✂️ Cut Out</strong> — pick a photo and tap <em>Remove background</em>. A small AI model runs on your device to erase the background and leave a transparent cutout. Save it to your Library.</li>
-        <li><strong>🎬 Scene</strong> — pick a base image, tap cutouts to drop them in, then move / resize / rotate them. Turn on cast shadows and pick a color grade, then <em>Merge</em> to flatten it into a finished image.</li>
-        <li><strong>📚 Library</strong> — your saved cutouts stay in this browser between visits.</li>
+        <li><strong>🖼️ Main image</strong> — the scene at the bottom of the stack. Give it its own exposure and colour.</li>
+        <li><strong>🧍 Subject</strong> — cut out in the <em>Cut Out</em> tab, saved to your Library, then tapped into the scene. Move / resize / rotate it, refine the cut edge, ground it with a contact shadow, and hit <em>Match subject to the scene</em> to harmonize its light and colour.</li>
+        <li><strong>🎞️ Overlay</strong> — a texture photo blended over the top (soft light, screen, multiply…) to carry the whole composite into one feel.</li>
+        <li><strong>✨ Finish</strong> — vignette, grain and a faded-black film curve over the flattened result.</li>
       </ul>
-      <p class="field-help">First background removal downloads the model once (cached afterward), so it needs a connection that first time. Everything is processed locally — your photos never leave your device.</p>
+      <p class="field-help">Every layer has an eye toggle so you can check its contribution. <strong>Auto edits</strong> set all of it in one tap — then move any slider you like. First background removal downloads the model once (cached afterward). Your photos never leave your device.</p>
       <div class="modal-actions"><button id="helpOk" class="btn btn-primary">Got it</button></div>
     </div>
   </div>
