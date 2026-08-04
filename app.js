@@ -143,7 +143,7 @@ const state = {
     selectedId: null, zTop: 1, look: null,
     refine: { reach: 45, strength: 80, spill: 80 },
   },
-  brush: { on: false, tool: "erase", size: 12, soft: 60, strength: 70 },
+  brush: { on: false, target: "subject", tool: "add", size: 12, soft: 60, strength: 70, showMask: true },
 };
 let idSeq = 0;
 const uid = (p) => `${p}_${Date.now().toString(36)}_${idSeq++}`;
@@ -707,10 +707,15 @@ function detectSky(img, { threshold = 50, feather = 30 } = {}) {
      sky, dilated region is confidently not, and the band between is unknown.
      The guided filter resolves the unknown band against the photograph, the
      way the hair matte does. Nothing here is tuned to one image. */
-  const band = Math.max(2, Math.round(closeR * 1.4));
+  // Asymmetric on purpose: trust the interior almost to the fill's own edge,
+  // and push the "might be sky" region well past it. The fill stops short of
+  // rooflines, so the unknown band has to sit OUTSIDE the boundary for the
+  // guided filter to find the real edge inside it.
+  const inR = Math.max(1, Math.round(closeR * 0.35));
+  const outR = Math.max(3, Math.round(closeR * 2.0));
   const sure = new Uint8Array(N), maybe = new Uint8Array(N);
-  morph(cls, sure, band, 0);      // erode  -> confidently sky
-  morph(cls, maybe, band, 1);     // dilate -> outside is confidently not sky
+  morph(cls, sure, inR, 0);       // erode a little -> confidently sky
+  morph(cls, maybe, outR, 1);     // dilate a lot   -> beyond this, not sky
 
   // 255 = sure sky, 0 = sure not-sky, 128 = unknown, resolved downstream.
   const m = cvOf(W, H);
@@ -1090,7 +1095,7 @@ function skyMask() {
 }
 function skyDataAt(W, H) {
   const S = state.scene;
-  const sig = `${S.base.token}|${S.night.skyDetect}|${S.night.skyFeather}|${S.night.skyEdge}|${W}x${H}`;
+  const sig = `${S.base.token}|${S.night.skyDetect}|${S.night.skyFeather}|${S.night.skyEdge}|${S.skyEditRev || 0}|${W}x${H}`;
   if (S._skyData && S._skyData.sig === sig) return S._skyData.data;
 
   // Refine at a working resolution: the guide only has to resolve the
@@ -1150,6 +1155,19 @@ function skyDataAt(W, H) {
   const data = c.getContext("2d").getImageData(0, 0, W, H).data;
   const conf = skyMask()._skyConfidence ?? 1;
   if (conf < 0.999) for (let i = 0; i < data.length; i += 4) data[i] *= conf;
+
+  // Hand corrections sit ON TOP of the detection rather than inside it, so
+  // re-detecting or moving the detection sliders never discards them.
+  if (S.skyEdit) {
+    const ec = cvOf(W, H);
+    ec.getContext("2d").drawImage(S.skyEdit, 0, 0, W, H);
+    const ed = ec.getContext("2d").getImageData(0, 0, W, H).data;
+    for (let i = 0; i < data.length; i += 4) {
+      const e = (ed[i] - 128) / 127;          // -1 remove, 0 neutral, +1 add
+      if (e > 0.004) data[i] = data[i] + (255 - data[i]) * e;
+      else if (e < -0.004) data[i] = data[i] * (1 + e);
+    }
+  }
   S._skyData = { sig, data };
   return data;
 }
@@ -1404,6 +1422,36 @@ function renderComposite(targetW, opts = {}) {
     ctx.globalAlpha = ov.opacity / 100;
     ctx.drawImage(tex, (W - dw) / 2, (H - dh) / 2);
     ctx.restore();
+  }
+
+  /* Mask overlay — the mask has to be visible to be edited with any
+     confidence, so it paints over the composite in red while brushing. */
+  if (state.brush.on && state.brush.showMask && S.base.img) {
+    let md = null;
+    if (state.brush.target === "sky") md = skyDataAt(W, H);
+    else {
+      const L = S.layers.find((x) => x.id === S.selectedId) || (S.layers.length === 1 ? S.layers[0] : null);
+      if (L) {
+        const mc = cvOf(W, H);
+        const w2 = Math.max(2, L.fw * W), h2 = w2 * (L.imgH / L.imgW);
+        const cx2 = L.fx * W, cy2 = L.fy * H;
+        const mx3 = mc.getContext("2d");
+        mx3.save(); mx3.translate(cx2, cy2); mx3.rotate((L.rot * Math.PI) / 180);
+        if (L.flipH) mx3.scale(-1, 1);
+        mx3.drawImage(L.mask, -w2 / 2, -h2 / 2, w2, h2); mx3.restore();
+        md = mx3.getImageData(0, 0, W, H).data;
+      }
+    }
+    if (md) {
+      const om = cvOf(W, H);
+      const oid = om.getContext("2d").createImageData(W, H);
+      for (let i = 0; i < oid.data.length; i += 4) {
+        oid.data[i] = 255; oid.data[i + 1] = 40; oid.data[i + 2] = 90;
+        oid.data[i + 3] = md[i] * 0.42;
+      }
+      om.getContext("2d").putImageData(oid, 0, 0);
+      ctx.drawImage(om, 0, 0);
+    }
   }
 
   /* Sky mask inspector — draw it over everything so it can be judged */
@@ -2002,11 +2050,161 @@ function renderHandles() {
 /* ============================================================
    MASK BRUSH — paint directly on the selected subject's matte
    ============================================================ */
+/* One tool set, whichever mask is being edited. "Add" means more of the
+   thing the mask selects — more subject, or more sky — so the same two
+   buttons read correctly in both places. */
 const BRUSH_TOOLS = {
-  erase:   { icon: "🩹", name: "Erase",    hint: "cut leftover background away" },
-  restore: { icon: "🖌", name: "Restore",  hint: "paint the subject back in" },
-  fix:     { icon: "💡", name: "Fix light", hint: "kill a glow / match the scene's light" },
+  add:     { icon: "➕", name: "Add",     hint: "paint the mask in" },
+  sub:     { icon: "➖", name: "Remove",  hint: "paint the mask out" },
+  wandAdd: { icon: "✨", name: "Tap +",   hint: "tap a spot — grows through everything that colour" },
+  wandSub: { icon: "🪄", name: "Tap −",   hint: "tap a spot — removes everything that colour" },
+  fix:     { icon: "💡", name: "Fix light", hint: "subject only — kill a glow" },
 };
+const MASK_TARGETS = {
+  subject: { icon: "🧍", name: "Subject" },
+  sky:     { icon: "🌌", name: "Sky" },
+};
+const isWand = (t) => t === "wandAdd" || t === "wandSub";
+
+/* ============================================================
+   MASK EDITING — no detector is right on every photograph
+
+   Automatic sky detection gets most scenes most of the way. It will
+   never get all of them, and a scene where it misses one roof is not a
+   scene worth abandoning. So every mask is directly editable: paint it
+   in or out, or tap a spot and let the region grow through everything
+   that colour — the tap being the useful one, since a missed roof is
+   usually one flat-toned area rather than something worth brushing.
+
+   Edits are stored as a signed layer over the detection, not baked into
+   it, so re-detecting or moving the detection sliders never throws away
+   hand corrections.
+   ============================================================ */
+function ensureSkyEdit() {
+  const S = state.scene;
+  const m = skyMask();
+  if (!S.skyEdit || S.skyEdit.width !== m.width || S.skyEdit.height !== m.height) {
+    const c = cvOf(m.width, m.height);
+    const x = c.getContext("2d");
+    x.fillStyle = "rgb(128,128,128)";       // 128 = leave the detection alone
+    x.fillRect(0, 0, c.width, c.height);
+    S.skyEdit = c;
+    S.skyEditRev = (S.skyEditRev || 0) + 1;
+  }
+  return S.skyEdit;
+}
+function skyEditDirty() {
+  const S = state.scene;
+  S.skyEditRev = (S.skyEditRev || 0) + 1;
+  S._skyData = null;
+  scheduleRender();
+}
+/* Scene point (fractions of the frame) -> sky-mask pixel. */
+function pointToSky(clientX, clientY) {
+  const r = dom.layerOverlay.getBoundingClientRect();
+  const m = ensureSkyEdit();
+  return {
+    x: ((clientX - r.left) / r.width) * m.width,
+    y: ((clientY - r.top) / r.height) * m.height,
+    w: m.width, h: m.height,
+  };
+}
+function paintSky(from, to) {
+  const B = state.brush;
+  const c = ensureSkyEdit();
+  const ctx = c.getContext("2d");
+  const radius = Math.max(1, (B.size / 100) * Math.min(c.width, c.height) * 0.35);
+  const alpha = (B.strength / 100) * 0.55;
+  const color = B.tool === "sub" ? "rgba(0,0,0,ALPHA)" : "rgba(255,255,255,ALPHA)";
+  const dist = Math.hypot(to.x - from.x, to.y - from.y);
+  const steps = Math.max(1, Math.ceil(dist / (radius * 0.3)));
+  for (let i = 1; i <= steps; i++) {
+    const t = i / steps;
+    stamp(ctx, from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t, radius, B.soft, alpha, color);
+  }
+  skyEditDirty();
+}
+/* Region grow shared by every mask: from the tapped pixel, through anything
+   close to it in colour, bounded so one tap cannot run away with the frame. */
+function growRegion(srcImg, W, H, pt, tolPct, sizePct) {
+  const g = cvOf(W, H);
+  g.getContext("2d").drawImage(srcImg, 0, 0, W, H);
+  const D = g.getContext("2d").getImageData(0, 0, W, H).data;
+  const sx = clamp(Math.round(pt.x), 0, W - 1), sy = clamp(Math.round(pt.y), 0, H - 1);
+  const si = (sy * W + sx) * 4;
+  const r0 = D[si], g0 = D[si + 1], b0 = D[si + 2];
+  const tol = (18 + (tolPct / 100) * 90) * 3;
+  const maxR = (sizePct / 100) * Math.max(W, H) * 2.2;
+  const seen = new Uint8Array(W * H), out = new Uint8Array(W * H);
+  const q = [sy * W + sx];
+  seen[sy * W + sx] = 1;
+  let n = 0;
+  while (q.length) {
+    const i = q.pop(); n++;
+    out[i] = 1;
+    const x = i % W, y = (i / W) | 0;
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const nx = x + dx, ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+      const ni = ny * W + nx;
+      if (seen[ni]) continue;
+      if (Math.hypot(nx - sx, ny - sy) > maxR) continue;
+      const j = ni * 4;
+      if (Math.abs(D[j] - r0) + Math.abs(D[j + 1] - g0) + Math.abs(D[j + 2] - b0) > tol) continue;
+      seen[ni] = 1; q.push(ni);
+    }
+  }
+  return { out, n };
+}
+
+function wandSubject(L, pt, add) {
+  const W = L.mask.width, H = L.mask.height;
+  const { out, n } = growRegion(L.src, W, H, pt, state.brush.strength, state.brush.size);
+  const ctx = L.mask.getContext("2d");
+  const id = ctx.getImageData(0, 0, W, H);
+  const v = add ? 255 : 0;
+  for (let i = 0; i < out.length; i++) {
+    if (!out[i]) continue;
+    const j = i * 4;
+    id.data[j] = id.data[j + 1] = id.data[j + 2] = v;
+  }
+  ctx.putImageData(id, 0, 0);
+  const soft = cvOf(W, H), sx2 = soft.getContext("2d");
+  sx2.filter = `blur(${Math.max(0.8, Math.min(W, H) / 500).toFixed(2)}px)`;
+  sx2.drawImage(L.mask, 0, 0);
+  ctx.clearRect(0, 0, W, H); ctx.drawImage(soft, 0, 0);
+  L.maskRev++; L._cache = null;
+  scheduleRender();
+  toast(`✨ ${add ? "Added" : "Removed"} ${Math.round((n / (W * H)) * 100)}% of the cut-out`);
+}
+
+/* Snapseed-style tap: grow from the tapped pixel through anything close to
+   it in colour, bounded so one tap can't run away with the whole frame. */
+function wandSky(pt, add) {
+  const S = state.scene;
+  const c = ensureSkyEdit();
+  const W = c.width, H = c.height;
+
+  const { out, n } = growRegion(S.base.img, W, H, pt, state.brush.strength, state.brush.size);
+
+  const ctx = c.getContext("2d");
+  const id = ctx.getImageData(0, 0, W, H);
+  const v = add ? 255 : 0;
+  for (let i = 0; i < out.length; i++) {
+    if (!out[i]) continue;
+    const j = i * 4;
+    id.data[j] = id.data[j + 1] = id.data[j + 2] = v;
+  }
+  ctx.putImageData(id, 0, 0);
+  // Soften what the wand grabbed so its edge isn't a hard cut-out.
+  const soft = cvOf(W, H), sc2 = soft.getContext("2d");
+  sc2.filter = "blur(1.2px)";
+  sc2.drawImage(c, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  ctx.drawImage(soft, 0, 0);
+  skyEditDirty();
+  toast(add ? `✨ Grew ${Math.round((n / (W * H)) * 100)}% of the frame into the sky` : "✨ Removed that region from the sky");
+}
 
 /* Screen point -> the layer's own mask pixels, undoing position, scale,
    rotation and flip so the brush lands where the cursor is. */
@@ -2035,6 +2233,22 @@ function stamp(ctx, x, y, radius, soft, alpha, color) {
   ctx.fill();
 }
 
+/* What is being painted on right now: the selected subject's matte, or the
+   scene's sky matte. */
+function maskTarget() {
+  const S = state.scene;
+  if (state.brush.target === "sky") {
+    if (!S.base.img) return null;
+    return { kind: "sky", canvas: ensureSkyEdit(), src: S.base.img };
+  }
+  const L = S.layers.find((x) => x.id === S.selectedId) || (S.layers.length === 1 ? S.layers[0] : null);
+  if (!L) return null;
+  return { kind: "subject", layer: L, canvas: L.mask, src: L.src };
+}
+function targetPoint(t, cx, cy) {
+  return t.kind === "sky" ? pointToSky(cx, cy) : pointToMask(t.layer, cx, cy);
+}
+
 function paintAt(L, from, to) {
   const B = state.brush;
   const target = B.tool === "fix" ? L.fix : L.mask;
@@ -2043,7 +2257,7 @@ function paintAt(L, from, to) {
   // whatever the subject is scaled to on screen.
   const radius = Math.max(1, (B.size / 200) * L.mask.width);
   const alpha = (B.strength / 100) * (B.tool === "fix" ? 0.35 : 0.5);
-  const color = B.tool === "erase" ? "rgba(0,0,0,ALPHA)" : "rgba(255,255,255,ALPHA)";
+  const color = B.tool === "sub" ? "rgba(0,0,0,ALPHA)" : "rgba(255,255,255,ALPHA)";
 
   ctx.save();
   if (B.tool === "fix") ctx.globalCompositeOperation = "lighter";
@@ -2060,18 +2274,20 @@ function paintAt(L, from, to) {
 
 let painting = null;
 function startPaint(e) {
-  // Fall back to the top layer rather than refusing to paint — if there is
-  // only one subject there is no ambiguity about what the user meant.
-  const S = state.scene;
-  const L = S.layers.find((x) => x.id === S.selectedId) || (S.layers.length === 1 ? S.layers[0] : null);
-  if (!L) { toast("Tap a subject in the Layers panel first, then brush.", true); return; }
-  S.selectedId = L.id;
+  const t = maskTarget();
+  if (!t) {
+    toast(state.brush.target === "sky" ? "Add a main image first." : "Tap a subject in the Layers panel first.", true);
+    return;
+  }
+  if (t.kind === "subject") state.scene.selectedId = t.layer.id;
   e.preventDefault();
   e.stopPropagation();
-  const p = pointToMask(L, e.clientX, e.clientY);
-  painting = { L, last: p };
-  paintAt(L, p, p);
-  scheduleRender();
+  const p = targetPoint(t, e.clientX, e.clientY);
+  painting = { t, last: p, startX: e.clientX, startY: e.clientY, moved: false, tool: state.brush.tool };
+  if (!isWand(painting.tool)) {
+    if (t.kind === "sky") paintSky(p, p); else paintAt(t.layer, p, p);
+    scheduleRender();
+  }
   dom.layerOverlay.setPointerCapture?.(e.pointerId);
   window.addEventListener("pointermove", movePaint);
   window.addEventListener("pointerup", endPaint);
@@ -2079,15 +2295,25 @@ function startPaint(e) {
 function movePaint(e) {
   if (!painting) return;
   e.preventDefault();
-  const p = pointToMask(painting.L, e.clientX, e.clientY);
-  paintAt(painting.L, painting.last, p);
+  if (Math.hypot(e.clientX - painting.startX, e.clientY - painting.startY) > 4) painting.moved = true;
+  if (isWand(painting.tool)) return;          // a wand acts on release, not on drag
+  const p = targetPoint(painting.t, e.clientX, e.clientY);
+  if (painting.t.kind === "sky") paintSky(painting.last, p);
+  else paintAt(painting.t.layer, painting.last, p);
   painting.last = p;
   scheduleRender();
 }
-function endPaint() {
+function endPaint(e) {
+  const p = painting;
   painting = null;
   window.removeEventListener("pointermove", movePaint);
   window.removeEventListener("pointerup", endPaint);
+  if (p && isWand(p.tool) && !p.moved) {
+    const add = p.tool === "wandAdd";
+    if (p.t.kind === "sky") wandSky(p.last, add);
+    else wandSubject(p.t.layer, p.last, add);
+    buildBrushBar();
+  }
 }
 
 function setBrush(on, tool) {
@@ -2205,8 +2431,11 @@ function updateSceneButtons() {
   dom.sceneDownloadBtn.disabled = !hasScene;
   dom.beforeAfterBtn.disabled = !hasScene;
   dom.layerDeleteBtn.disabled = !state.scene.selectedId;
-  dom.brushToggle.disabled = !hasLayers;
-  if (!hasLayers && state.brush.on) setBrush(false);
+  dom.brushToggle.disabled = !hasScene;
+  if (!hasScene && state.brush.on) setBrush(false);
+  if (!hasLayers && state.brush.target === "subject" && state.brush.on) {
+    state.brush.target = "sky";          // nothing to paint on but the sky
+  }
   dom.layerFlattenReset.disabled = !hasLayers;
   dom.harmonizeBtn.disabled = !hasScene || !hasLayers;
   dom.mergeBtn.textContent = hasLayers || state.scene.overlay.img
@@ -2661,9 +2890,32 @@ function buildBrushBar() {
   const L = state.scene.layers.find((x) => x.id === state.scene.selectedId);
   bar.innerHTML = "";
 
+  // What am I masking?
+  const tgt = document.createElement("div");
+  tgt.className = "brush-tools";
+  Object.entries(MASK_TARGETS).forEach(([k, t]) => {
+    const b = document.createElement("button");
+    b.className = "tool-btn" + (B.target === k ? " active" : "");
+    b.textContent = `${t.icon} ${t.name}`;
+    b.addEventListener("click", () => {
+      B.target = k;
+      if (k === "sky" && B.tool === "fix") B.tool = "add";
+      buildBrushBar(); scheduleRender();
+    });
+    tgt.appendChild(b);
+  });
+  const showMask = document.createElement("button");
+  showMask.className = "tool-btn" + (B.showMask ? " active" : "");
+  showMask.textContent = "👁 Show mask";
+  showMask.title = "See the mask in red while you work";
+  showMask.addEventListener("click", () => { B.showMask = !B.showMask; buildBrushBar(); scheduleRender(); });
+  tgt.appendChild(showMask);
+  bar.appendChild(tgt);
+
   const tools = document.createElement("div");
   tools.className = "brush-tools";
   Object.entries(BRUSH_TOOLS).forEach(([k, t]) => {
+    if (k === "fix" && B.target === "sky") return;      // subject-only
     const b = document.createElement("button");
     b.className = "tool-btn" + (B.tool === k ? " active" : "");
     b.textContent = `${t.icon} ${t.name}`;
@@ -2685,9 +2937,9 @@ function buildBrushBar() {
   };
   const rows = document.createElement("div");
   rows.className = "brush-rows";
-  rows.appendChild(mini("Size", "size", 1, 60));
+  rows.appendChild(mini(isWand(B.tool) ? "Reach" : "Size", "size", 1, 60));
   rows.appendChild(mini("Soft", "soft", 0, 100));
-  rows.appendChild(mini("Strength", "strength", 5, 100));
+  rows.appendChild(mini(isWand(B.tool) ? "Tolerance" : "Strength", "strength", 5, 100));
   bar.appendChild(rows);
 
   const acts = document.createElement("div");
@@ -2697,7 +2949,13 @@ function buildBrushBar() {
     b.className = "tool-btn tiny"; b.textContent = label; if (title) b.title = title;
     b.addEventListener("click", fn); acts.appendChild(b);
   };
-  if (L) {
+  if (B.target === "sky") {
+    add("↺ Reset sky edits", () => {
+      state.scene.skyEdit = null; ensureSkyEdit(); skyEditDirty();
+      toast("Hand edits to the sky mask cleared — detection only.");
+    });
+  }
+  if (L && B.target === "subject") {
     add("✨ Refine hair", () => runRefineHair(L), "Re-solve the edge from the photo");
     add("↺ Reset mask", async () => {
       const asset = state.library.find((a) => a.id === L.assetId);
@@ -2717,8 +2975,9 @@ function buildBrushBar() {
 
   const hint = document.createElement("p");
   hint.className = "brush-hint";
-  hint.textContent = L
-    ? `Painting on “${L.name}”. ${BRUSH_TOOLS[B.tool].hint}.`
+  const what = B.target === "sky" ? "the sky mask" : (L ? `“${L.name}”` : null);
+  hint.textContent = what
+    ? `${isWand(B.tool) ? "Tap" : "Drag"} on the image — ${BRUSH_TOOLS[B.tool].hint}. Editing ${what}.`
     : "Select a subject in the Layers panel to paint on it.";
   bar.appendChild(hint);
 }
