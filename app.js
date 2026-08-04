@@ -537,8 +537,21 @@ function renderComposite(targetW, opts = {}) {
 /* ============================================================
    HARMONIZE — read the scene, dial the subject to match
    ============================================================ */
+/* Two deliberate choices here, both learned from real photos:
+
+   Exposure/contrast come from the MEDIAN and the 16–84 percentile spread,
+   not the mean and standard deviation. A blown-out sky or a subject in
+   near-black clothing drags a mean around badly; the median doesn't care.
+
+   The colour cast comes from NEAR-NEUTRAL pixels only, weighted by how grey
+   they are. Saturated surfaces carry their own pigment, not the light in the
+   room — averaging a scene's foliage and mossy concrete tells you the moss
+   is green, and matching a person to it turns their skin green. Weighting
+   toward greys estimates the illuminant instead, which is the thing the
+   subject actually needs to agree with. */
 function statsFrom(data, w, h, rect, alphaOnly) {
-  let n = 0, sL = 0, sLL = 0, sRB = 0, sGM = 0, sC = 0;
+  const lum = [];
+  let n = 0, sC = 0, wsum = 0, sRB = 0, sGM = 0;
   const x0 = clamp(Math.floor(rect.x), 0, w - 1), x1 = clamp(Math.ceil(rect.x + rect.w), 1, w);
   const y0 = clamp(Math.floor(rect.y), 0, h - 1), y1 = clamp(Math.ceil(rect.y + rect.h), 1, h);
   const step = Math.max(1, Math.floor(Math.max(x1 - x0, y1 - y0) / 160));
@@ -548,13 +561,24 @@ function statsFrom(data, w, h, rect, alphaOnly) {
       if (alphaOnly && data[i + 3] < 200) continue;
       const r = data[i] / 255, g = data[i + 1] / 255, b = data[i + 2] / 255;
       const L = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-      const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
-      n++; sL += L; sLL += L * L; sRB += r - b; sGM += g - (r + b) / 2; sC += mx - mn;
+      const chroma = Math.max(r, g, b) - Math.min(r, g, b);
+      lum.push(L);
+      n++; sC += chroma;
+      // Greyer pixels vote harder on the illuminant; near-clipped ones abstain.
+      const nw = Math.max(0, 1 - chroma / 0.40) * (L > 0.03 && L < 0.97 ? 1 : 0.15);
+      wsum += nw; sRB += (r - b) * nw; sGM += (g - (r + b) / 2) * nw;
     }
   }
   if (!n) return null;
-  const mL = sL / n;
-  return { n, L: mL, std: Math.sqrt(Math.max(0, sLL / n - mL * mL)), rb: sRB / n, gm: sGM / n, chroma: sC / n };
+  lum.sort((a, b) => a - b);
+  const at = (p) => lum[clamp(Math.round(p * (lum.length - 1)), 0, lum.length - 1)];
+  const spread = Math.max(0.02, (at(0.84) - at(0.16)) / 2);
+  const W_ = Math.max(1e-4, wsum);
+  // Lhi is the exposure anchor: the brightest surfaces are the ones sitting
+  // closest to white under the prevailing light, so they track illumination.
+  // The median tracks albedo instead — anchoring on it forces a subject in
+  // navy clothing up to the brightness of the concrete wall behind them.
+  return { n, L: at(0.5), Lhi: at(0.88), std: spread, rb: sRB / W_, gm: sGM / W_, chroma: sC / n };
 }
 
 /* Where the subject sits, in the base image's own pixel space. */
@@ -609,11 +633,15 @@ function harmonizeLayer(L, strength = 0.85) {
   const k = clamp(strength, 0, 1);
   const a = L.adj;
   // Invert each adjustment's own model so the numbers land where they should.
-  a.exposure    = Math.round(clamp(Math.log2(Math.max(0.05, sceneStats.L) / Math.max(0.05, subjStats.L)) * 100 * k, -70, 70));
+  // Each channel is damped by how trustworthy its signal is. Exposure and
+  // temperature are solid. Tint is the dangerous one — a green cast on skin
+  // reads as illness long before it reads as "matched" — and chroma between a
+  // person and a landscape is barely comparable at all, so both are held back.
+  a.exposure    = Math.round(clamp(Math.log2(Math.max(0.05, sceneStats.Lhi) / Math.max(0.05, subjStats.Lhi)) * 100 * k, -35, 35));
   a.contrast    = Math.round(clamp((sceneStats.std / Math.max(0.02, subjStats.std) - 1) * 100 * k * 0.7, -45, 45));
   a.temperature = Math.round(clamp(((sceneStats.rb - subjStats.rb) / 0.36) * 100 * k, -80, 80));
-  a.tint        = Math.round(clamp((-(sceneStats.gm - subjStats.gm) / 0.15) * 100 * k, -60, 60));
-  a.saturation  = Math.round(clamp((sceneStats.chroma / Math.max(0.02, subjStats.chroma) - 1) * 100 * k * 0.8, -60, 60));
+  a.tint        = Math.round(clamp((-(sceneStats.gm - subjStats.gm) / 0.15) * 100 * k * 0.55, -30, 30));
+  a.saturation  = Math.round(clamp((sceneStats.chroma / Math.max(0.02, subjStats.chroma) - 1) * 100 * k * 0.45, -35, 35));
   L._cache = null;
   return true;
 }
