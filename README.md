@@ -23,11 +23,16 @@ Every layer has an **eye toggle** and its own sliders. **Auto edits** set the wh
 
 A subject shot at golden hour dropped into an overcast yard reads as pasted on. **🎯 Match subject to the scene** fixes that automatically:
 
-- it samples the main image **in the region where the subject is standing** (a subject in shade should match the shade, not the whole frame),
+- it samples the main image **as it currently looks — with your grade baked in**, not the raw upload,
+- **in the region where the subject is standing** (a subject in shade should match the shade, not the whole frame),
 - samples the subject's own opaque pixels,
 - and inverts each adjustment's model to solve for the **exposure, contrast, temperature, tint and saturation** that close the gap.
 
-It runs automatically when you place a cutout, and the numbers land in the sliders — so it's a starting point you can *work off*, not a black box. Then, per subject:
+Sampling the *graded* scene is the whole point: the target has to be the scene you're actually on. Each subject carries a **Follow the scene** switch (on by default) — while it's on, the match re-runs whenever you grade the main image or drag the subject somewhere new, so cooling the scene pulls the subject blue with it. Move any of the subject's own light-and-colour sliders and the follow switches off, because you've taken over.
+
+> Overlay and Finish are deliberately *excluded* from the sampling. They composite on top of the subject too, so they move both sides equally — folding them into the target would double-count them. `base.adj` is the only thing that shifts the scene out from under the subject.
+
+The numbers land in the sliders, so it's a starting point you can *work off*, not a black box. Then, per subject:
 
 | Control | What it fixes |
 | --- | --- |
@@ -42,7 +47,7 @@ The contact shadow is placed from the sprite's **opaque bounding box**, so it si
 
 ## Auto edits
 
-Each look **harmonizes the subject to the scene first**, then applies a creative offset across all layers — so the presets stay scene-aware instead of stamping fixed numbers on top.
+Each look **grades the scene first, then matches the subject to the graded scene**, then adds its creative offset — so the presets stay scene-aware instead of stamping fixed numbers on top. (Doing those first two in the other order is exactly the bug: you match the subject to a scene, then move the scene out from under it.)
 
 | | |
 | --- | --- |

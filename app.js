@@ -112,7 +112,7 @@ const state = {
   cut: { file: null, src: null, result: null, busy: false },
   scene: {
     versions: [], currentId: null,
-    base: { img: null, adj: newAdj(), visible: true },
+    base: { img: null, adj: newAdj(), visible: true, token: 0 },
     layers: [],
     overlay: { dataUrl: null, img: null, visible: true, blend: "soft-light", opacity: 40, rot: 0, flipH: false, adj: newAdj() },
     finish: { visible: true, vignette: 0, grain: 0, fade: 0 },
@@ -563,14 +563,33 @@ function sceneRectFor(L, W, H) {
   return { x: L.fx * W - w / 2, y: L.fy * H - h / 2, w, h };
 }
 
+/* The scene as it currently looks — the main image WITH its own grade baked
+   in. Matching against the raw upload is wrong: the moment you grade the
+   scene (or an auto edit does), the subject would be matching a scene that
+   no longer exists.
+
+   Overlay and Finish are deliberately excluded. They composite on top of the
+   subject too, so they move both sides equally; folding them in here would
+   double-count them. base.adj is the only thing that shifts the scene out
+   from under the subject. */
+function baseAnalysis() {
+  const S = state.scene;
+  const sig = S.base.token + "|" + JSON.stringify(S.base.adj);
+  if (S._an && S._an.sig === sig) return S._an;
+  const W = 640, H = Math.max(1, Math.round(W * (S.base.img.naturalHeight / S.base.img.naturalWidth)));
+  const c = cvOf(W, H);
+  const x = c.getContext("2d");
+  x.drawImage(S.base.img, 0, 0, W, H);
+  const id = x.getImageData(0, 0, W, H);
+  applyAdjust(id, S.base.adj);
+  S._an = { sig, W, H, data: id.data };
+  return S._an;
+}
+
 function harmonizeLayer(L, strength = 0.85) {
   const S = state.scene;
   if (!S.base.img || !L) return false;
-  const W = 640, H = Math.round(W * (S.base.img.naturalHeight / S.base.img.naturalWidth));
-
-  const bc = cvOf(W, H);
-  bc.getContext("2d").drawImage(S.base.img, 0, 0, W, H);
-  const bd = bc.getContext("2d").getImageData(0, 0, W, H).data;
+  const { W, H, data: bd } = baseAnalysis();
 
   // Sample the scene around the subject, not the whole frame — a subject
   // standing in shade should match the shade.
@@ -597,6 +616,38 @@ function harmonizeLayer(L, strength = 0.85) {
   a.saturation  = Math.round(clamp((sceneStats.chroma / Math.max(0.02, subjStats.chroma) - 1) * 100 * k * 0.8, -60, 60));
   L._cache = null;
   return true;
+}
+
+/* Re-match a layer that is still following the scene, then re-apply the
+   current look's creative offset on top — so re-matching never wipes the
+   look, and the look never freezes a stale match. */
+function autoMatchLayer(L, force = false) {
+  if (!L || (!L.autoMatch && !force)) return false;
+  if (!harmonizeLayer(L, (L.matchStrength ?? 85) / 100)) return false;
+  const look = LOOKS[state.scene.look];
+  if (look) {
+    Object.entries(look.subject).forEach(([k, v]) => {
+      L.adj[k] = clamp((L.adj[k] || 0) + v, -100, 100);
+    });
+  }
+  L._cache = null;
+  return true;
+}
+function autoMatchAll() {
+  let any = false;
+  state.scene.layers.forEach((L) => { if (autoMatchLayer(L)) any = true; });
+  return any;
+}
+/* A manual move on a subject's light/colour slider means the user has taken
+   over — stop overwriting them from the scene. */
+function breakFollow(L, card) {
+  if (!L.autoMatch) return;
+  L.autoMatch = false;
+  const box = card && card.querySelector('input[data-follow="1"]');
+  if (box) box.checked = false;
+  const meta = card && card.querySelector(".lcard-meta");
+  if (meta) meta.textContent = `${Math.round(L.fw * 100)}% · manual`;
+  toast("Following the scene turned off for this subject — your values stick now.");
 }
 
 /* ============================================================
@@ -779,6 +830,8 @@ function pushSceneVersion(dataUrl) {
 }
 async function showScene(dataUrl) {
   state.scene.base.img = await loadImage(dataUrl);
+  state.scene.base.token++;
+  state.scene._an = null;
   buildLayerStack(); scheduleRender(); positionOverlay(); updateSceneButtons();
 }
 async function setOverlay(file) {
@@ -844,12 +897,13 @@ function addLayerFromAsset(asset) {
       imgW: im.naturalWidth, imgH: im.naturalHeight,
       fx: 0.5, fy: 0.58, fw: 0.42, rot: 0, flipH: false,
       opacity: 100, visible: true, z: ++state.scene.zTop,
+      autoMatch: true, matchStrength: 85,
       adj: newAdj(), matte: newMatte(), shadow: newShadow(),
       name: `Subject ${state.scene.layers.length + 1}`, _cache: null,
     };
     state.scene.layers.push(L);
     state.scene.selectedId = L.id;
-    harmonizeLayer(L, 0.85);
+    autoMatchLayer(L, true);
     buildLayerStack(); scheduleRender(); updateSceneButtons();
     status("Placed and auto-matched to the scene. Drag to move · corner = resize · top handle = rotate.");
   });
@@ -914,6 +968,10 @@ function moveLayerPointer(e) {
   scheduleRender();
 }
 function endLayerPointer() {
+  // A subject dragged into shade should match the shade it landed in.
+  if (drag && (drag.role === "move" || drag.role === "resize") && autoMatchLayer(drag.L)) {
+    buildLayerStack(); scheduleRender();
+  }
   drag = null;
   window.removeEventListener("pointermove", moveLayerPointer);
   window.removeEventListener("pointerup", endLayerPointer);
@@ -941,6 +999,19 @@ function updateSceneButtons() {
 /* ============================================================
    LAYER PANEL UI
    ============================================================ */
+/* Every slider registers itself, so an auto-match can push new numbers into
+   the visible controls without rebuilding the panel — rebuilding mid-drag
+   would destroy the input the user is holding. */
+let sliderRegistry = [];
+function syncSliders() {
+  for (const s of sliderRegistry) {
+    if (s.input === document.activeElement) continue;   // don't fight a live drag
+    const v = s.obj[s.k] ?? 0;
+    if (Number(s.input.value) !== v) s.input.value = v;
+    s.out.textContent = v + s.unit;
+  }
+}
+
 function sliderRow(spec, obj, onChange) {
   const row = document.createElement("div");
   row.className = "srow";
@@ -963,6 +1034,7 @@ function sliderRow(spec, obj, onChange) {
   input.addEventListener("input", commit);
   row.addEventListener("dblclick", () => { input.value = spec.def ?? 0; commit(); });
   row.appendChild(input);
+  sliderRegistry.push({ input, out, obj, k: spec.k, unit: spec.unit || "" });
   return row;
 }
 
@@ -1021,6 +1093,7 @@ function buildLayerStack() {
   const S = state.scene;
   const host = dom.layerStack;
   host.innerHTML = "";
+  sliderRegistry = [];
   if (!S.base.img) return;
   const rerender = () => scheduleRender();
 
@@ -1078,7 +1151,8 @@ function buildLayerStack() {
   /* 🧍 Subjects — top of the stack first */
   [...S.layers].sort((a, b) => b.z - a.z).forEach((L) => {
     host.appendChild(sectionCard({
-      key: "ly_" + L.id, icon: "🧍", title: L.name, meta: `${Math.round(L.fw * 100)}%`,
+      key: "ly_" + L.id, icon: "🧍", title: L.name,
+      meta: `${Math.round(L.fw * 100)}% · ${L.autoMatch ? "following scene" : "manual"}`,
       visible: L.visible, selected: L.id === S.selectedId,
       onToggle: () => { L.visible = !L.visible; buildLayerStack(); rerender(); },
       onSelect: () => { S.selectedId = L.id; renderHandles(); updateSceneButtons(); },
@@ -1091,8 +1165,36 @@ function buildLayerStack() {
       ]),
       body: (b) => {
         b.appendChild(sliderRow({ k: "opacity", label: "Opacity", min: 0, max: 100, unit: "%" }, L, rerender));
+
+        b.appendChild(groupLabel("Match to the scene"));
+        const follow = document.createElement("label");
+        follow.className = "switch";
+        follow.innerHTML =
+          `<input type="checkbox" data-follow="1" ${L.autoMatch ? "checked" : ""} />` +
+          `<span>Follow the scene</span>`;
+        follow.querySelector("input").addEventListener("change", (e) => {
+          L.autoMatch = e.target.checked;
+          if (L.autoMatch) autoMatchLayer(L);
+          buildLayerStack(); rerender();
+        });
+        b.appendChild(follow);
+        const fh = document.createElement("p");
+        fh.className = "panel-hint dim";
+        fh.style.margin = "5px 0 0";
+        fh.textContent = "Re-reads the scene — as you grade it, and as you move this subject around it — and keeps the light and colour below matched. Moving any of them yourself turns this off.";
+        b.appendChild(fh);
+        b.appendChild(sliderRow(
+          { k: "matchStrength", label: "Match strength", min: 0, max: 100, unit: "%" },
+          L,
+          () => { autoMatchLayer(L); syncSliders(); rerender(); }
+        ));
+
         b.appendChild(groupLabel("Light & colour"));
-        ADJ_ROWS.forEach((sp) => b.appendChild(sliderRow(sp, L.adj, () => { L._cache = null; rerender(); })));
+        ADJ_ROWS.forEach((sp) => b.appendChild(sliderRow(sp, L.adj, () => {
+          L._cache = null;
+          breakFollow(L, b.closest(".lcard"));
+          rerender();
+        })));
         b.appendChild(sliderRow({ k: "blur", label: "Blur", min: 0, max: 100, hint: "match scene focus" }, L.adj, () => { L._cache = null; rerender(); }));
         b.appendChild(sliderRow({ k: "grain", label: "Grain", min: 0, max: 100, hint: "match scene noise" }, L.adj, () => { L._cache = null; rerender(); }));
         b.appendChild(groupLabel("Cut edge"));
@@ -1115,9 +1217,14 @@ function buildLayerStack() {
     onToggle: () => { S.base.visible = !S.base.visible; buildLayerStack(); rerender(); },
     actions: btnRow([
       ["＋ Replace", () => openPicker("scene")],
-      ["↺ Reset", () => { S.base.adj = newAdj(); buildLayerStack(); rerender(); }],
+      ["↺ Reset", () => { S.base.adj = newAdj(); S._an = null; autoMatchAll(); buildLayerStack(); rerender(); }],
     ]),
-    body: (b) => { ADJ_ROWS.forEach((sp) => b.appendChild(sliderRow(sp, S.base.adj, rerender))); },
+    body: (b) => {
+      // Grading the scene moves the target the subjects were matched to, so
+      // any subject still following it gets re-matched as the slider moves.
+      const onBase = () => { S._an = null; if (autoMatchAll()) syncSliders(); rerender(); };
+      ADJ_ROWS.forEach((sp) => b.appendChild(sliderRow(sp, S.base.adj, onBase)));
+    },
   }));
 }
 
@@ -1140,11 +1247,16 @@ function applyLook(key) {
   const S = state.scene;
   if (!look || !S.base.img) return;
 
+  // Order matters: grade the scene FIRST, then match subjects to the graded
+  // scene. Doing it the other way round matches them to the ungraded upload
+  // and then moves the scene out from under them.
   S.base.adj = Object.assign(newAdj(), look.base);
+  S._an = null;
+  S.look = key;
   S.layers.forEach((L) => {
-    harmonizeLayer(L, look.match);           // scene-aware first…
-    Object.entries(look.subject).forEach(([k, v]) => { L.adj[k] = clamp((L.adj[k] || 0) + v, -100, 100); }); // …then the creative offset
-    L._cache = null;
+    L.matchStrength = Math.round(look.match * 100);
+    L.autoMatch = true;
+    autoMatchLayer(L, true);   // matches the graded scene, then adds look.subject
   });
   const ovAdj = newAdj();
   Object.entries(look.overlay).forEach(([k, v]) => { if (k !== "opacity" && k !== "blend") ovAdj[k] = v; });
@@ -1227,7 +1339,7 @@ function newSession() {
   state.cut = { file: null, src: null, result: null, busy: false };
   state.scene = {
     versions: [], currentId: null,
-    base: { img: null, adj: newAdj(), visible: true },
+    base: { img: null, adj: newAdj(), visible: true, token: 0 },
     layers: [],
     overlay: { dataUrl: null, img: null, visible: true, blend: "soft-light", opacity: 40, rot: 0, flipH: false, adj: newAdj() },
     finish: { visible: true, vignette: 0, grain: 0, fade: 0 },
@@ -1297,7 +1409,8 @@ function init() {
     const S = state.scene;
     const L = S.layers.find((x) => x.id === S.selectedId) || S.layers[S.layers.length - 1];
     if (!L) return;
-    if (harmonizeLayer(L, 0.85)) {
+    if (autoMatchLayer(L, true)) {
+      L.autoMatch = true;
       buildLayerStack(); scheduleRender();
       status("Subject matched to the scene's light and colour ✓", "ok");
       toast("🎯 Matched to the scene ✓");
