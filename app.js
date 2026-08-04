@@ -101,7 +101,7 @@ const LOOKS = {
   },
   night: {
     name: "Night", icon: "🌙", match: 0.9,
-    night: { visible: true, amount: 86, skyHue: 222, skySat: 20, skyDark: 78, horizonGlow: 40, stars: 40, lampWarmth: 78, ambient: 46 },
+    night: { visible: true, amount: 86, skyHue: 222, skySat: 20, skyDark: 78, horizonGlow: 40, stars: 40, lampWarmth: 78, ambient: 46, killDaylight: 84 },
     base: { contrast: 10, saturation: -18, highlights: -14 },
     subject: { exposure: -14, temperature: -12, saturation: -10 },
     overlay: { opacity: 18, blend: "soft-light", saturation: -40, exposure: -20 },
@@ -110,7 +110,7 @@ const LOOKS = {
   },
   fireflies: {
     name: "Fireflies", icon: "🪰", match: 0.9,
-    night: { visible: true, amount: 76, skyHue: 230, skySat: 24, skyDark: 72, horizonGlow: 46, stars: 28, lampWarmth: 82, ambient: 48 },
+    night: { visible: true, amount: 76, skyHue: 230, skySat: 24, skyDark: 72, horizonGlow: 46, stars: 28, lampWarmth: 82, ambient: 48, killDaylight: 80 },
     base: { contrast: 8, saturation: -12, highlights: -10 },
     subject: { exposure: -10, temperature: -8 },
     overlay: { opacity: 14, blend: "soft-light", saturation: -30, exposure: -18 },
@@ -139,7 +139,7 @@ const state = {
     finish: { visible: true, vignette: 0, grain: 0, fade: 0, blacks: 0, shoulder: 0, contrast: 0 },
     glow: { visible: false, count: 0, size: 30, spread: 60, cy: 62, intensity: 65, hue: 68, seed: 7 },
     lights: [],
-    night: { visible: false, amount: 0, skyHue: 220, skySat: 22, skyDark: 78, skyDetail: 70, shadowCool: 18, lightWarm: 55, horizonGlow: 35, glowSide: 70, stars: 0, lampWarmth: 72, skyDetect: 50, skyFeather: 30, skyEdge: 70, ambient: 42, seed: 3 },
+    night: { visible: false, amount: 0, skyHue: 220, skySat: 22, skyDark: 78, skyDetail: 70, shadowCool: 18, lightWarm: 55, horizonGlow: 35, glowSide: 70, stars: 0, lampWarmth: 72, skyDetect: 50, skyFeather: 30, skyEdge: 70, skyTighten: 0, ambient: 42, killDaylight: 78, seed: 3 },
     selectedId: null, zTop: 1, look: null,
     refine: { reach: 45, strength: 80, spill: 80 },
   },
@@ -888,7 +888,16 @@ function applyNight(id, W, H, skyData, N) {
         // Real night has skylight fill: shadows go dark, not to zero. Without
         // a floor the foreground of every scene blocks up solid black.
         const amb = (N.ambient ?? 22) / 100;
-        const mul = 1 - kk * 0.74 * (1 - amb * 0.42);
+        /* A uniform multiplier keeps bright things proportionally bright: white
+           aerial hardware at 240 halves to 120 while the sky lands near 46, so
+           it reads as if something is shining on it. But it is bright because
+           of DAYLIGHT, and at night there is no daylight to reflect. Compress
+           the highlights of unlit ground hard — anything genuinely lit is
+           already excluded by the lamp protection above, and the placeable
+           lights are applied after this, so real light still lands. */
+        const dayHi = clamp((L - 0.25) / 0.75, 0, 1);
+        const noSun = 1 - kk * dayHi * ((N.killDaylight ?? 78) / 100) * (1 - protect);
+        const mul = (1 - kk * 0.74 * (1 - amb * 0.42)) * noSun;
         r *= mul; g *= mul; b *= mul;
         const L2 = 0.2126 * r + 0.7152 * g + 0.0722 * b;
         r += (L2 - r) * kk * 0.5;            // night vision desaturates…
@@ -1137,7 +1146,7 @@ function skyMask() {
 }
 function skyDataAt(W, H) {
   const S = state.scene;
-  const sig = `${S.base.token}|${S.night.skyDetect}|${S.night.skyFeather}|${S.night.skyEdge}|${S.skyEditRev || 0}|${W}x${H}`;
+  const sig = `${S.base.token}|${S.night.skyDetect}|${S.night.skyFeather}|${S.night.skyEdge}|${S.night.skyTighten}|${S.skyEditRev || 0}|${W}x${H}`;
   if (S._skyData && S._skyData.sig === sig) return S._skyData.data;
 
   // Refine at a working resolution: the guide only has to resolve the
@@ -1220,6 +1229,18 @@ function skyDataAt(W, H) {
     if (gate) q[i] *= gate[i];          // geometry proposes, appearance disposes
   }
 
+  /* Tighten pulls the matte in off the edge, feather softens it. Separate
+     from "edge snap", which decides where the edge IS — this decides how
+     hard it lands once found. */
+  const tighten = (S.night.skyTighten ?? 0) / 100;
+  if (tighten > 0) {
+    const t0 = tighten * 0.55;
+    for (let i = 0; i < n; i++) q[i] = clamp((q[i] - t0) / Math.max(0.05, 1 - t0), 0, 1);
+  } else if (tighten < 0) {
+    const g0 = -tighten * 0.5;
+    for (let i = 0; i < n; i++) q[i] = clamp(q[i] * (1 + g0) , 0, 1);
+  }
+
   const out = cvOf(w, h);
   const oid = out.getContext("2d").createImageData(w, h);
   for (let i = 0; i < n; i++) {
@@ -1229,8 +1250,18 @@ function skyDataAt(W, H) {
   }
   out.getContext("2d").putImageData(oid, 0, 0);
 
+  const soften = (S.night.skyFeather ?? 30) / 100;
+  let src2 = out;
+  if (soften > 0.02) {
+    const f = cvOf(w, h);
+    const fx2 = f.getContext("2d");
+    fx2.filter = `blur(${(soften * Math.min(w, h) / 150 + 0.3).toFixed(2)}px)`;
+    fx2.drawImage(out, 0, 0);
+    src2 = f;
+  }
+
   const c = cvOf(W, H);
-  c.getContext("2d").drawImage(out, 0, 0, W, H);
+  c.getContext("2d").drawImage(src2, 0, 0, W, H);
   const data = c.getContext("2d").getImageData(0, 0, W, H).data;
   const conf = skyMask()._skyConfidence ?? 1;
   if (conf < 0.999) for (let i = 0; i < data.length; i += 4) data[i] *= conf;
@@ -2644,6 +2675,13 @@ function buildLayerStack() {
     visible: S.night.visible,
     onToggle: () => { S.night.visible = !S.night.visible; S._an = null; autoMatchAll(); buildLayerStack(); rerender(); },
     actions: btnRow([
+      ["✏️ Edit sky mask", () => {
+        state.brush.target = "sky";
+        state.brush.tool = "wandAdd";
+        state.brush.showMask = true;
+        setBrush(true);
+        status("Tap a roof it missed to add it · ➕/➖ to brush · the mask shows in red.", "ok");
+      }, "Add or remove sky by hand — tap or brush"],
       ["🌙 Full night", () => { Object.assign(S.night, { visible: true, amount: 88, stars: 45 }); S._an = null; autoMatchAll(); buildLayerStack(); rerender(); }],
       ["🌆 Dusk", () => { Object.assign(S.night, { visible: true, amount: 52, stars: 12 }); S._an = null; autoMatchAll(); buildLayerStack(); rerender(); }],
       ["👁 Show sky mask", () => { S.showSky = !S.showSky; rerender(); }, "Check what was detected as sky"],
@@ -2666,6 +2704,7 @@ function buildLayerStack() {
         { k: "stars",       label: "Stars",        min: 0, max: 100 },
         { k: "lampWarmth",  label: "Keep lamps lit", min: 0, max: 100, hint: "protects warm light" },
         { k: "ambient",     label: "Ambient fill", min: 0, max: 100, hint: "keeps shadows off pure black" },
+        { k: "killDaylight", label: "Kill daylight", min: 0, max: 100, hint: "unlit bright things go dark" },
         { k: "shadowCool",  label: "Shadow coolness", min: 0, max: 100 },
         { k: "lightWarm",   label: "Highlight warmth", min: 0, max: 100, hint: "where the depth comes from" },
       ].forEach((sp) => b.appendChild(sliderRow(sp, S.night, nightChange)));
@@ -2674,6 +2713,7 @@ function buildLayerStack() {
         { k: "skyDetect",  label: "Spread",  min: 0, max: 100, hint: "how far the fill runs" },
         { k: "skyFeather", label: "Softness", min: 0, max: 100 },
         { k: "skyEdge",    label: "Edge snap", min: 0, max: 100, hint: "follow the roofline" },
+        { k: "skyTighten", label: "Tighten", min: -100, max: 100, hint: "pull the matte in ↔ let it out" },
       ].forEach((sp) => b.appendChild(sliderRow(sp, S.night, () => { S._sky = null; S._skyData = null; nightChange(); })));
     },
   }));
@@ -3135,7 +3175,7 @@ function newSession() {
     finish: { visible: true, vignette: 0, grain: 0, fade: 0, blacks: 0, shoulder: 0, contrast: 0 },
     glow: { visible: false, count: 0, size: 30, spread: 60, cy: 62, intensity: 65, hue: 68, seed: 7 },
     lights: [],
-    night: { visible: false, amount: 0, skyHue: 220, skySat: 22, skyDark: 78, skyDetail: 70, shadowCool: 18, lightWarm: 55, horizonGlow: 35, glowSide: 70, stars: 0, lampWarmth: 72, skyDetect: 50, skyFeather: 30, skyEdge: 70, ambient: 42, seed: 3 },
+    night: { visible: false, amount: 0, skyHue: 220, skySat: 22, skyDark: 78, skyDetail: 70, shadowCool: 18, lightWarm: 55, horizonGlow: 35, glowSide: 70, stars: 0, lampWarmth: 72, skyDetect: 50, skyFeather: 30, skyEdge: 70, skyTighten: 0, ambient: 42, killDaylight: 78, seed: 3 },
     refine: { reach: 45, strength: 80, spill: 80 },
     selectedId: null, zTop: 1, look: null,
   };
