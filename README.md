@@ -45,6 +45,18 @@ The numbers land in the sliders, so it's a starting point you can *work off*, no
 
 The contact shadow is placed from the sprite's **opaque bounding box**, so it sits at the subject's actual feet, not at the bottom of a mostly-empty PNG.
 
+## Cut-out models
+
+Side by side on a backlit portrait, the model matters far more than any amount of edge post-processing:
+
+| | |
+| --- | --- |
+| **Fast** | isnet fp16 — quick, small download, default |
+| **Sharper** | isnet full precision — better edges |
+| **Best for hair** | BiRefNet — the golden rim of blown sky that the others weld onto hair simply isn't there |
+
+BiRefNet is a much larger first download, so it stays opt-in; if it can't load, the app falls back to Fast and says so.
+
 ## Fixing the cut edge
 
 Background removal returns a hard silhouette. On the sample photo the matte came back **688k fully-transparent and 615k fully-opaque pixels with nothing in between** — every hair strand either chopped off or welded to a chunk of blown-out sky.

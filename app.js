@@ -125,7 +125,7 @@ const LOOKS = {
 const state = {
   tab: "cut",
   library: [],
-  cut: { file: null, src: null, result: null, busy: false },
+  cut: { file: null, src: null, result: null, busy: false, model: "fast" },
   scene: {
     versions: [], currentId: null,
     base: { img: null, adj: newAdj(), visible: true, token: 0 },
@@ -154,7 +154,7 @@ const dom = {};
   "beforeAfterBtn","sceneDownloadBtn",
   "historyStrip","historyItems",
   "libraryItems","libCount","libHint",
-  "cutPanel","cutRunBtn",
+  "cutPanel","cutRunBtn","cutModelChips",
   "scenePanel","lookChips","harmonizeBtn","layerStack","mergeBtn","copyPromptBtn","statusMsg",
   "fileInput","cutUploadTrigger","sceneUploadTrigger",
   "newSessionBtn","helpBtn","helpModal","helpClose","helpOk",
@@ -318,6 +318,69 @@ async function ensureImgly() {
     } catch (e) { lastErr = e; }
   }
   throw lastErr || new Error("Could not load the background-removal module.");
+}
+
+/* ------------------------------------------------------------------
+   Cut-out models
+
+   Side-by-side on a backlit portrait, the default model welds a bright
+   rim of blown sky onto the hair; BiRefNet does not. It's a much bigger
+   quality jump than any amount of edge post-processing, so it's worth
+   the larger download — but it IS larger, so it stays opt-in and the
+   fast model remains the default.
+   ------------------------------------------------------------------ */
+const CUT_MODELS = {
+  fast:  { name: "Fast", note: "quick, small download", engine: "imgly", model: "isnet_fp16" },
+  sharp: { name: "Sharper", note: "full-precision, better edges", engine: "imgly", model: "isnet" },
+  hair:  { name: "Best for hair", note: "BiRefNet · big first download", engine: "birefnet" },
+};
+
+const TRANSFORMERS_SOURCES = [
+  "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.5.1",
+  "https://esm.sh/@huggingface/transformers@3.5.1",
+];
+let _birefnet = null;
+async function ensureBiRefNet(onProgress) {
+  if (_birefnet) return _birefnet;
+  let lastErr;
+  for (const url of TRANSFORMERS_SOURCES) {
+    try {
+      const tf = await import(url);
+      const opts = { progress_callback: onProgress };
+      const model = await tf.AutoModel.from_pretrained("onnx-community/BiRefNet_lite", { dtype: "fp32", ...opts });
+      const processor = await tf.AutoProcessor.from_pretrained("onnx-community/BiRefNet_lite", opts);
+      _birefnet = { tf, model, processor };
+      return _birefnet;
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error("Could not load BiRefNet.");
+}
+
+/* Returns an RGBA cutout Blob, same contract as imgly's removeBackground. */
+async function removeBackgroundBiRefNet(pngBlob, onProgress) {
+  const { tf, model, processor } = await ensureBiRefNet(onProgress);
+  const url = URL.createObjectURL(pngBlob);
+  try {
+    const image = await tf.RawImage.fromURL(url);
+    const { pixel_values } = await processor(image);
+    const out = await model({ input_image: pixel_values });
+    // Output tensor naming varies between exports — take the first tensor.
+    let t = out.output_image ?? out.output ?? out.logits ?? Object.values(out)[0];
+    if (Array.isArray(t)) t = t[0];
+    if (t.dims && t.dims.length === 4) t = t[0];
+    const maskImg = await tf.RawImage.fromTensor(t.sigmoid().mul(255).to("uint8")).resize(image.width, image.height);
+
+    const c = cvOf(image.width, image.height);
+    const x = c.getContext("2d");
+    const src = await loadImage(url);
+    x.drawImage(src, 0, 0);
+    const id = x.getImageData(0, 0, c.width, c.height);
+    const md = maskImg.data;
+    const step = md.length / (c.width * c.height);   // 1 for greyscale, 3/4 if not
+    for (let i = 0, p = 0; i < id.data.length; i += 4, p += step) id.data[i + 3] = md[p | 0];
+    x.putImageData(id, 0, 0);
+    return await new Promise((res, rej) => c.toBlob((b) => (b ? res(b) : rej(new Error("encode failed"))), "image/png"));
+  } finally { URL.revokeObjectURL(url); }
 }
 
 /* ============================================================
@@ -1015,18 +1078,25 @@ async function runCut() {
   try {
     const pngBlob = await toPngBlob(state.cut.src);
     cutBusy(true, "Loading model…");
-    const removeBackground = window.__cpsRemoveBg || (await ensureImgly());
-    const blob = await removeBackground(pngBlob, {
-      output: { format: "image/png" },
-      progress: (key, current, total) => {
-        if (key && key.startsWith("fetch")) {
-          const pct = total ? Math.round((current / total) * 100) : 0;
-          dom.cutLoadingText.textContent = `Downloading model… ${pct}%`;
-        } else {
-          dom.cutLoadingText.textContent = "Removing background…";
-        }
-      },
-    });
+    const choice = CUT_MODELS[state.cut.model] || CUT_MODELS.fast;
+    const note = (p) => {
+      if (p && typeof p.progress === "number") dom.cutLoadingText.textContent = `Downloading ${choice.name} model… ${Math.round(p.progress)}%`;
+    };
+
+    let blob;
+    if (window.__cpsRemoveBg) {
+      blob = await window.__cpsRemoveBg(pngBlob, { output: { format: "image/png" } });
+    } else if (choice.engine === "birefnet") {
+      try {
+        blob = await removeBackgroundBiRefNet(pngBlob, note);
+      } catch (e) {
+        console.warn("[cutout] BiRefNet unavailable, falling back:", e);
+        toast("BiRefNet couldn't load — using the fast model instead.", true);
+        blob = await runImgly(pngBlob, CUT_MODELS.fast);
+      }
+    } else {
+      blob = await runImgly(pngBlob, choice);
+    }
     const dataUrl = await blobToDataUrl(blob);
     state.cut.result = dataUrl;
     dom.cutImg.src = dataUrl;
@@ -1041,6 +1111,22 @@ async function runCut() {
     cutBusy(false);
   }
 }
+async function runImgly(pngBlob, choice) {
+  const removeBackground = await ensureImgly();
+  return await removeBackground(pngBlob, {
+    model: choice.model,
+    output: { format: "image/png" },
+    progress: (key, current, total) => {
+      if (key && key.startsWith("fetch")) {
+        const pct = total ? Math.round((current / total) * 100) : 0;
+        dom.cutLoadingText.textContent = `Downloading model… ${pct}%`;
+      } else {
+        dom.cutLoadingText.textContent = "Removing background…";
+      }
+    },
+  });
+}
+
 function cutBusy(b, text = "Removing background…") {
   state.cut.busy = b;
   dom.cutLoading.hidden = !b;
@@ -1810,6 +1896,19 @@ function applyLook(key) {
   toast(`${look.icon} ${look.name} applied ✓`);
 }
 
+function buildModelChips() {
+  if (!dom.cutModelChips) return;
+  dom.cutModelChips.innerHTML = "";
+  Object.entries(CUT_MODELS).forEach(([k, m]) => {
+    const b = document.createElement("button");
+    b.className = "chip" + (state.cut.model === k ? " active" : "");
+    b.innerHTML = `${m.name}<em> · ${m.note}</em>`;
+    b.title = m.note;
+    b.addEventListener("click", () => { state.cut.model = k; buildModelChips(); });
+    dom.cutModelChips.appendChild(b);
+  });
+}
+
 /* ---- Brush bar (sits under the stage while painting) ---- */
 function buildBrushBar() {
   const bar = dom.brushBar;
@@ -1974,7 +2073,7 @@ function newSession() {
 const openPicker = (target) => { uploadTarget = target; dom.fileInput.click(); };
 
 async function init() {
-  await loadLibrary(); renderLibrary(); buildLookChips(); updateSceneButtons();
+  await loadLibrary(); renderLibrary(); buildModelChips(); buildLookChips(); updateSceneButtons();
 
   document.querySelectorAll(".tab").forEach((t) => t.addEventListener("click", () => setTab(t.dataset.tab)));
 

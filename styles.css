@@ -339,3 +339,7 @@ body {
   .library { max-height: 160px; }
   .stage-canvas { min-height: 220px; }
 }
+
+/* Model picker chips */
+.chip em { font-style: normal; color: var(--text-faint); font-size: 11px; }
+.chip.active em { color: var(--accent); }
