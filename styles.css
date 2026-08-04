@@ -343,3 +343,15 @@ body {
 /* Model picker chips */
 .chip em { font-style: normal; color: var(--text-faint); font-size: 11px; }
 .chip.active em { color: var(--accent); }
+
+/* Draggable light handles on the stage */
+.light-handle {
+  position: absolute; transform: translate(-50%, -50%);
+  width: 34px; height: 34px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 17px; cursor: grab; pointer-events: auto; touch-action: none;
+  background: radial-gradient(circle, rgba(255,214,140,.95) 0%, rgba(255,170,60,.35) 55%, rgba(255,170,60,0) 100%);
+  text-shadow: 0 0 6px rgba(0,0,0,.7);
+}
+.light-handle.selected { outline: 2px solid #fff; outline-offset: 2px; }
+.light-handle:active { cursor: grabbing; }

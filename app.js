@@ -98,7 +98,7 @@ const LOOKS = {
   },
   night: {
     name: "Night", icon: "🌙", match: 0.9,
-    night: { visible: true, amount: 88, skyHue: 220, skyDark: 78, horizonGlow: 38, stars: 45, lampWarmth: 75 },
+    night: { visible: true, amount: 88, skyHue: 222, skySat: 20, skyDark: 80, horizonGlow: 40, stars: 40, lampWarmth: 78 },
     base: { contrast: 10, saturation: -18, highlights: -14 },
     subject: { exposure: -14, temperature: -12, saturation: -10 },
     overlay: { opacity: 18, blend: "soft-light", saturation: -40, exposure: -20 },
@@ -107,7 +107,7 @@ const LOOKS = {
   },
   fireflies: {
     name: "Fireflies", icon: "🪰", match: 0.9,
-    night: { visible: true, amount: 78, skyHue: 232, skyDark: 70, horizonGlow: 46, stars: 30, lampWarmth: 80 },
+    night: { visible: true, amount: 78, skyHue: 230, skySat: 24, skyDark: 72, horizonGlow: 46, stars: 28, lampWarmth: 82 },
     base: { contrast: 8, saturation: -12, highlights: -10 },
     subject: { exposure: -10, temperature: -8 },
     overlay: { opacity: 14, blend: "soft-light", saturation: -30, exposure: -18 },
@@ -135,7 +135,8 @@ const state = {
     overlay: { dataUrl: null, img: null, visible: true, blend: "soft-light", opacity: 40, rot: 0, flipH: false, adj: newAdj() },
     finish: { visible: true, vignette: 0, grain: 0, fade: 0 },
     glow: { visible: false, count: 0, size: 30, spread: 60, cy: 62, intensity: 65, hue: 68, seed: 7 },
-    night: { visible: false, amount: 0, skyHue: 220, skyDark: 78, skyDetail: 70, horizonGlow: 35, glowSide: 70, stars: 0, lampWarmth: 72, skyDetect: 50, skyFeather: 30, seed: 3 },
+    lights: [],
+    night: { visible: false, amount: 0, skyHue: 220, skySat: 22, skyDark: 78, skyDetail: 70, horizonGlow: 35, glowSide: 70, stars: 0, lampWarmth: 72, skyDetect: 50, skyFeather: 30, seed: 3 },
     selectedId: null, zTop: 1, look: null,
     refine: { reach: 45, strength: 80, spill: 80 },
   },
@@ -153,7 +154,7 @@ const dom = {};
   "cutRotL","cutRotR","cutFlip",
   "sceneStage","sceneEmpty","sceneWrap","sceneCanvas","layerOverlay",
   "cutToolbar","cutAddBtn","cutSaveBtn","cutDownloadBtn",
-  "sceneToolbar","sceneAddBtn","overlayAddBtn","brushToggle","brushBar","layerDeleteBtn","layerFlattenReset",
+  "sceneToolbar","sceneAddBtn","overlayAddBtn","lightAddBtn","brushToggle","brushBar","layerDeleteBtn","layerFlattenReset",
   "beforeAfterBtn","sceneDownloadBtn",
   "historyStrip","historyItems",
   "libraryItems","libCount","libHint",
@@ -735,7 +736,7 @@ function applyNight(id, W, H, skyData, N) {
   skyBottom = Math.max(skyBottom, H * 0.12);
 
   const hue = ((N.skyHue || 220) % 360) / 360;
-  const tint = hsl2rgb(hue, 0.45, 0.5);
+  const tint = hsl2rgb(hue, clamp((N.skySat ?? 22) / 100, 0, 1), 0.5);
   const keepCloud = (N.skyDetail ?? 70) / 100;
 
   /* Crucially the sky is re-exposed, not painted over. An overcast sky has
@@ -789,7 +790,12 @@ function applyNight(id, W, H, skyData, N) {
         r += (L2 - r) * kk * 0.5;            // night vision desaturates…
         g += (L2 - g) * kk * 0.5;
         b += (L2 - b) * kk * 0.5;
-        b += kk * 0.055; r -= kk * 0.022;    // …and shifts blue
+        // …and shifts blue, hardest in the deepest shadow. Warm highlights
+        // against cool shadow is what gives a night frame its depth; a flat
+        // sepia wash over everything is what kills it.
+        const deep = 1 - clamp(L2 / 0.42, 0, 1);
+        const cool = kk * (0.03 + deep * 0.085);
+        b += cool; r -= cool * 0.75; g -= cool * 0.22;
       }
       if (sky > 0) {
         const ks = k * sky;
@@ -799,7 +805,8 @@ function applyNight(id, W, H, skyData, N) {
           // to one side and let it fall off, the way sodium glow really sits.
           const side = (N.glowSide ?? 50) / 100;
           const lateral = 1 - Math.abs(x / W - side) * 1.5;
-          const gl = glow * ks * Math.pow(t, 2.4) * clamp(lateral, 0, 1);
+          const prof = Math.pow(t, 2.0) * (1 - Math.pow(clamp(t, 0, 1), 7));
+          const gl = glow * ks * prof * 1.9 * clamp(lateral, 0, 1);
           r += gl * 0.42; g += gl * 0.25; b += gl * 0.10;
         }
       }
@@ -817,6 +824,133 @@ function hsl2rgb(h, s, l) {
     return l - s * Math.min(l, 1 - l) * Math.max(-1, Math.min(k - 3, 9 - k, 1));
   };
   return [f(0), f(8), f(4)];
+}
+
+/* ============================================================
+   PLACEABLE LIGHTS
+
+   A light is not a bright blob pasted on top. Adding colour uniformly
+   washes a scene flat, because it lifts black brick exactly as much as
+   white render. Real light *scales* what a surface already reflects, so
+   the dominant term here is multiplicative: gain rides on the surface's
+   own albedo, and a dark bin stays dark while pale brick lights up.
+
+   A smaller additive term rides along for the air near the source — the
+   haze around a lamp that genuinely does add light regardless of what's
+   behind it.
+   ============================================================ */
+const LIGHT_TYPES = {
+  lamp:      { name: "Lamp",      icon: "💡", hue: 34,  sat: 78, spread: 360 },
+  sodium:    { name: "Streetlamp", icon: "🏮", hue: 26, sat: 92, spread: 360 },
+  window:    { name: "Window",    icon: "🪟", hue: 40,  sat: 62, spread: 360 },
+  headlight: { name: "Headlight", icon: "🚗", hue: 48,  sat: 22, spread: 46 },
+  neon:      { name: "Neon",      icon: "🩵", hue: 190, sat: 88, spread: 360 },
+  moon:      { name: "Moonlight", icon: "🌙", hue: 218, sat: 45, spread: 360 },
+};
+const newLight = (type = "sodium") => {
+  const t = LIGHT_TYPES[type];
+  return {
+    id: uid("lt"), type, visible: true,
+    x: 0.72, y: 0.3, radius: 42, intensity: 70,
+    hue: t.hue, sat: t.sat, falloff: 55,
+    beamAngle: 200, beamSpread: t.spread, airlight: 30,
+  };
+};
+
+function applyLights(id, W, H, lights, unit, skyData) {
+  const live = lights.filter((l) => l.visible && l.intensity > 0);
+  if (!live.length) return id;
+  const d = id.data;
+
+  // Precompute per-light constants so the inner loop stays cheap.
+  const P = live.map((l) => {
+    const rgb = hsl2rgb(((l.hue % 360) + 360) % 360 / 360, clamp(l.sat / 100, 0, 1), 0.5);
+    const peak = Math.max(rgb[0], rgb[1], rgb[2]) || 1;
+    return {
+      cx: l.x * W, cy: l.y * H,
+      R: Math.max(4, (l.radius / 100) * Math.max(W, H) * 0.9),
+      k: l.intensity / 100,
+      air: (l.airlight || 0) / 100,
+      pow: 1 + (l.falloff / 100) * 3.2,
+      r: rgb[0] / peak, g: rgb[1] / peak, b: rgb[2] / peak,
+      cone: l.beamSpread < 359,
+      dir: ((l.beamAngle || 0) * Math.PI) / 180,
+      half: ((l.beamSpread || 360) / 2) * (Math.PI / 180),
+    };
+  });
+
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      let gr = 0, gg = 0, gb = 0, ar = 0, ag = 0, ab = 0;
+      for (let i = 0; i < P.length; i++) {
+        const p = P[i];
+        const dx = x - p.cx, dy = y - p.cy;
+        const dist = Math.sqrt(dx * dx + dy * dy) / p.R;
+        if (dist > 3.2) continue;
+        let f = 1 / (1 + Math.pow(dist, p.pow) * 4);
+        if (p.cone) {
+          // A headlight is a cone: fall off toward the edge of the beam
+          // rather than cutting a hard-edged wedge out of the frame.
+          let a = Math.atan2(dy, dx) - p.dir;
+          while (a > Math.PI) a -= Math.PI * 2;
+          while (a < -Math.PI) a += Math.PI * 2;
+          const t = clamp(1 - Math.abs(a) / p.half, 0, 1);
+          f *= t * t * (3 - 2 * t);
+        }
+        if (f <= 0.002) continue;
+        const s = f * p.k;
+        gr += p.r * s; gg += p.g * s; gb += p.b * s;
+        if (p.air) {
+          const h = f * f * p.k * p.air;
+          ar += p.r * h; ag += p.g * h; ab += p.b * h;
+        }
+      }
+      if (gr + gg + gb + ar + ag + ab < 0.0015) continue;
+      const i4 = (y * W + x) * 4;
+      // A lamp lights surfaces, not the clouds. Without this the sky picks
+      // up the full falloff and the whole frame reads as a sunset instead of
+      // a lit street. A little haze still reaches it, so it isn't cut to zero.
+      if (skyData) {
+        const sky = skyData[i4] / 255;
+        if (sky > 0.004) {
+          const keepS = 1 - sky * 0.93, keepA = 1 - sky * 0.72;
+          gr *= keepS; gg *= keepS; gb *= keepS;
+          ar *= keepA; ag *= keepA; ab *= keepA;
+        }
+      }
+      let r = d[i4] / 255, g = d[i4 + 1] / 255, b = d[i4 + 2] / 255;
+      r = r * (1 + gr * 2.6) + ar * 0.5;   // multiplicative on albedo…
+      g = g * (1 + gg * 2.6) + ag * 0.5;   // …plus a little air
+      b = b * (1 + gb * 2.6) + ab * 0.5;
+      d[i4]     = r <= 0 ? 0 : r >= 1 ? 255 : r * 255;
+      d[i4 + 1] = g <= 0 ? 0 : g >= 1 ? 255 : g * 255;
+      d[i4 + 2] = b <= 0 ? 0 : b >= 1 ? 255 : b * 255;
+    }
+  }
+  return id;
+}
+
+/* The scene rearranges itself around the light: every subject that is
+   following it turns its shadow away from the source and lengthens it
+   with distance, and the sky's glow slides to the light's side. */
+function lightsDriveScene() {
+  const S = state.scene;
+  const key = S.lights
+    .filter((l) => l.visible && l.intensity > 0)
+    .sort((a, b) => b.intensity * b.radius - a.intensity * a.radius)[0];
+  if (!key) return false;
+  let touched = false;
+  for (const L of S.layers) {
+    if (L.shadowFollow === false) continue;
+    const vx = L.fx - key.x, vy = L.fy - key.y;
+    const len = Math.hypot(vx, vy) || 1e-4;
+    // shadow offset direction is (-sin a, cos a), so solve for a
+    L.shadow.angle = Math.round((((Math.atan2(-vx / len, vy / len) * 180) / Math.PI) % 360 + 360) % 360);
+    L.shadow.length = Math.round(clamp(12 + len * 110, 5, 100));
+    touched = true;
+  }
+  if (S.night.visible) S.night.glowSide = Math.round(clamp(key.x * 100, 0, 100));
+  return touched;
 }
 
 /* Local "fix light" paint — desaturate, cool and pull down the highlights
@@ -1049,7 +1183,14 @@ function renderComposite(targetW, opts = {}) {
     ctx.restore();
   }
 
-  /* 3 — glow specks (fireflies, embers, dust catching the light).
+  /* 3 — placeable lights, after the subjects so they light them too */
+  if (S.lights.length) {
+    const lid = ctx.getImageData(0, 0, W, H);
+    applyLights(lid, W, H, S.lights, unit, S.night.visible && S.night.amount > 0 ? skyDataAt(W, H) : null);
+    ctx.putImageData(lid, 0, 0);
+  }
+
+  /* 4 — glow specks (fireflies, embers, dust catching the light).
      Additive, so they read as emitted light rather than pasted dots. */
   const G = S.glow;
   if (G.visible && G.count > 0) {
@@ -1080,7 +1221,7 @@ function renderComposite(targetW, opts = {}) {
     ctx.restore();
   }
 
-  /* 4 — texture overlay */
+  /* 5 — texture overlay */
   const ov = S.overlay;
   if (ov.img && ov.visible && ov.opacity > 0) {
     const ow = ov.img.naturalWidth, oh = ov.img.naturalHeight;
@@ -1126,7 +1267,7 @@ function renderComposite(targetW, opts = {}) {
     ctx.restore();
   }
 
-  /* 5 — finish */
+  /* 6 — finish */
   const F = S.finish;
   if (F.visible) {
     if (F.vignette > 0) {
@@ -1652,6 +1793,17 @@ function renderHandles() {
   ov.innerHTML = "";
   if (previewBase) return;
   if (state.brush.on) return;   // the overlay itself becomes the paint surface
+  for (const lt of state.scene.lights) {
+    if (!lt.visible) continue;
+    const h = document.createElement("div");
+    h.className = "light-handle" + (state.scene.selectedLight === lt.id ? " selected" : "");
+    h.style.left = lt.x * ow + "px";
+    h.style.top = lt.y * oh + "px";
+    h.textContent = LIGHT_TYPES[lt.type]?.icon || "💡";
+    h.title = "Drag to move the light — shadows follow it";
+    h.addEventListener("pointerdown", (e) => startLightDrag(e, lt));
+    ov.appendChild(h);
+  }
   for (const L of sortedLayers()) {
     if (!L.visible) continue;
     const div = document.createElement("div");
@@ -1795,6 +1947,32 @@ async function runRefineHair(L) {
   }
 }
 
+let lightDrag = null;
+function startLightDrag(e, lt) {
+  e.preventDefault(); e.stopPropagation();
+  state.scene.selectedLight = lt.id;
+  const r = dom.layerOverlay.getBoundingClientRect();
+  lightDrag = { lt, r };
+  e.target.setPointerCapture?.(e.pointerId);
+  window.addEventListener("pointermove", moveLightDrag);
+  window.addEventListener("pointerup", endLightDrag);
+  buildLayerStack();
+}
+function moveLightDrag(e) {
+  if (!lightDrag) return;
+  const { lt, r } = lightDrag;
+  lt.x = clamp((e.clientX - r.left) / r.width, -0.3, 1.3);
+  lt.y = clamp((e.clientY - r.top) / r.height, -0.3, 1.3);
+  lightsDriveScene();
+  scheduleRender();
+}
+function endLightDrag() {
+  lightDrag = null;
+  window.removeEventListener("pointermove", moveLightDrag);
+  window.removeEventListener("pointerup", endLightDrag);
+  syncSliders(); buildLayerStack(); scheduleRender();
+}
+
 /* ---- Pointer interaction ---- */
 let drag = null;
 function startLayerPointer(e, L) {
@@ -1830,8 +2008,10 @@ function moveLayerPointer(e) {
 }
 function endLayerPointer() {
   // A subject dragged into shade should match the shade it landed in.
-  if (drag && (drag.role === "move" || drag.role === "resize") && autoMatchLayer(drag.L)) {
-    buildLayerStack(); scheduleRender();
+  if (drag && (drag.role === "move" || drag.role === "resize")) {
+    const m = autoMatchLayer(drag.L);
+    const s2 = lightsDriveScene();
+    if (m || s2) { syncSliders(); buildLayerStack(); scheduleRender(); }
   }
   drag = null;
   window.removeEventListener("pointermove", moveLayerPointer);
@@ -1990,6 +2170,7 @@ function buildLayerStack() {
         { k: "amount",      label: "Night",        min: 0, max: 100 },
         { k: "skyDark",     label: "Sky darkness", min: 0, max: 100 },
         { k: "skyHue",      label: "Sky colour",   min: 0, max: 359, unit: "°" },
+        { k: "skySat",      label: "Sky saturation", min: 0, max: 100, hint: "keep it near-neutral" },
         { k: "skyDetail",   label: "Cloud detail", min: 0, max: 100, hint: "keeps the sky's own structure" },
         { k: "horizonGlow", label: "City glow",    min: 0, max: 100, hint: "sodium light pollution" },
         { k: "glowSide",    label: "Glow from",    min: 0, max: 100, hint: "left ↔ right" },
@@ -2001,6 +2182,54 @@ function buildLayerStack() {
         { k: "skyDetect",  label: "Spread",  min: 0, max: 100, hint: "how far the fill runs" },
         { k: "skyFeather", label: "Softness", min: 0, max: 100 },
       ].forEach((sp) => b.appendChild(sliderRow(sp, S.night, () => { S._sky = null; nightChange(); })));
+    },
+  }));
+
+  /* 💡 Lights */
+  host.appendChild(sectionCard({
+    key: "lights", icon: "💡", title: "Lights",
+    meta: S.lights.length ? `${S.lights.length} placed` : "none",
+    visible: true,
+    onToggle: () => { const any = S.lights.some((l) => l.visible); S.lights.forEach((l) => (l.visible = !any)); buildLayerStack(); rerender(); },
+    actions: btnRow(Object.entries(LIGHT_TYPES).map(([k, t]) => [
+      `${t.icon} ${t.name}`,
+      () => {
+        const lt = newLight(k);
+        S.lights.push(lt); S.selectedLight = lt.id;
+        lightsDriveScene(); buildLayerStack(); rerender();
+        status("Light placed — drag it on the image, shadows follow it.", "ok");
+      },
+      `Add a ${t.name.toLowerCase()}`,
+    ])),
+    body: (b) => {
+      const p = document.createElement("p");
+      p.className = "panel-hint"; p.style.margin = "2px 0 8px";
+      p.textContent = S.lights.length
+        ? "Drag a light on the image. Subjects turn their shadows away from it and lengthen them with distance, and the sky's glow slides to its side."
+        : "Add a light, then drag it on the image. The scene re-solves around it — shadow direction, shadow length and the sky's glow all follow.";
+      b.appendChild(p);
+      S.lights.forEach((lt, i) => {
+        const t = LIGHT_TYPES[lt.type] || LIGHT_TYPES.lamp;
+        b.appendChild(groupLabel(`${t.icon} ${t.name} ${i + 1}${S.selectedLight === lt.id ? " · selected" : ""}`));
+        b.appendChild(btnRow([
+          ["◎ Select", () => { S.selectedLight = lt.id; buildLayerStack(); renderHandles(); }],
+          [lt.visible ? "👁 On" : "🚫 Off", () => { lt.visible = !lt.visible; buildLayerStack(); rerender(); }],
+          ["🗑", () => { S.lights = S.lights.filter((z) => z.id !== lt.id); buildLayerStack(); rerender(); }, "Remove"],
+        ]));
+        const rows = [
+          { k: "intensity", label: "Brightness", min: 0, max: 100 },
+          { k: "radius",    label: "Reach",      min: 2, max: 100 },
+          { k: "falloff",   label: "Falloff",    min: 0, max: 100, hint: "tight ↔ soft" },
+          { k: "hue",       label: "Colour",     min: 0, max: 359, unit: "°" },
+          { k: "sat",       label: "Saturation", min: 0, max: 100 },
+          { k: "airlight",  label: "Haze",       min: 0, max: 100, hint: "glow in the air" },
+        ];
+        if (lt.beamSpread < 359) {
+          rows.push({ k: "beamAngle",  label: "Beam aim",   min: 0, max: 359, unit: "°" });
+          rows.push({ k: "beamSpread", label: "Beam width", min: 5, max: 359, unit: "°" });
+        }
+        rows.forEach((sp) => b.appendChild(sliderRow(sp, lt, () => { lightsDriveScene(); rerender(); })));
+      });
     },
   }));
 
@@ -2145,6 +2374,15 @@ function buildLayerStack() {
         sw.innerHTML = `<input type="checkbox" ${L.shadow.on ? "checked" : ""} /><span>Cast &amp; contact shadow</span>`;
         sw.querySelector("input").addEventListener("change", (e) => { L.shadow.on = e.target.checked; rerender(); });
         b.appendChild(sw);
+        const fw = document.createElement("label");
+        fw.className = "switch";
+        fw.innerHTML = `<input type="checkbox" ${L.shadowFollow !== false ? "checked" : ""} /><span>Aim shadow at the light</span>`;
+        fw.querySelector("input").addEventListener("change", (e) => {
+          L.shadowFollow = e.target.checked;
+          if (L.shadowFollow) { lightsDriveScene(); syncSliders(); }
+          rerender();
+        });
+        b.appendChild(fw);
         SHADOW_ROWS.forEach((sp) => b.appendChild(sliderRow(sp, L.shadow, rerender)));
       },
     }));
@@ -2373,7 +2611,8 @@ function newSession() {
     overlay: { dataUrl: null, img: null, visible: true, blend: "soft-light", opacity: 40, rot: 0, flipH: false, adj: newAdj() },
     finish: { visible: true, vignette: 0, grain: 0, fade: 0 },
     glow: { visible: false, count: 0, size: 30, spread: 60, cy: 62, intensity: 65, hue: 68, seed: 7 },
-    night: { visible: false, amount: 0, skyHue: 220, skyDark: 78, skyDetail: 70, horizonGlow: 35, glowSide: 70, stars: 0, lampWarmth: 72, skyDetect: 50, skyFeather: 30, seed: 3 },
+    lights: [],
+    night: { visible: false, amount: 0, skyHue: 220, skySat: 22, skyDark: 78, skyDetail: 70, horizonGlow: 35, glowSide: 70, stars: 0, lampWarmth: 72, skyDetect: 50, skyFeather: 30, seed: 3 },
     refine: { reach: 45, strength: 80, spill: 80 },
     selectedId: null, zTop: 1, look: null,
   };
@@ -2435,6 +2674,12 @@ async function init() {
   });
   dom.sceneDownloadBtn.addEventListener("click", downloadScene);
   dom.brushToggle.addEventListener("click", () => setBrush(!state.brush.on));
+  dom.lightAddBtn.addEventListener("click", () => {
+    const lt = newLight("sodium");
+    state.scene.lights.push(lt); state.scene.selectedLight = lt.id;
+    lightsDriveScene(); buildLayerStack(); scheduleRender();
+    toast("Light placed — drag it on the image.");
+  });
   dom.layerOverlay.addEventListener("pointerdown", (e) => { if (state.brush.on) startPaint(e); });
   dom.copyPromptBtn.addEventListener("click", async () => {
     const ok = await copyText(RELIGHT_PROMPT);
