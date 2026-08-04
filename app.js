@@ -1367,9 +1367,14 @@ function paintAt(L, from, to) {
 
 let painting = null;
 function startPaint(e) {
-  const L = state.scene.layers.find((x) => x.id === state.scene.selectedId);
-  if (!L) { toast("Pick a subject layer to paint on.", true); return; }
+  // Fall back to the top layer rather than refusing to paint — if there is
+  // only one subject there is no ambiguity about what the user meant.
+  const S = state.scene;
+  const L = S.layers.find((x) => x.id === S.selectedId) || (S.layers.length === 1 ? S.layers[0] : null);
+  if (!L) { toast("Tap a subject in the Layers panel first, then brush.", true); return; }
+  S.selectedId = L.id;
   e.preventDefault();
+  e.stopPropagation();
   const p = pointToMask(L, e.clientX, e.clientY);
   painting = { L, last: p };
   paintAt(L, p, p);
@@ -2034,6 +2039,10 @@ async function init() {
   ["pointerup", "pointerleave", "pointercancel"].forEach((ev) => dom.beforeAfterBtn.addEventListener(ev, () => setBase(false)));
 
   dom.sceneWrap.addEventListener("pointerdown", (e) => {
+    // While brushing, a stroke starts on the overlay and bubbles to here.
+    // Deselecting on it would clear the very layer being painted, so the
+    // brush would work exactly once and then go dead.
+    if (state.brush.on) return;
     if (e.target === dom.sceneWrap || e.target === dom.sceneCanvas || e.target === dom.layerOverlay) {
       state.scene.selectedId = null; renderHandles(); updateSceneButtons();
     }
