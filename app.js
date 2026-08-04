@@ -101,20 +101,20 @@ const LOOKS = {
   },
   night: {
     name: "Night", icon: "🌙", match: 0.9,
-    night: { visible: true, amount: 88, skyHue: 222, skySat: 20, skyDark: 80, horizonGlow: 40, stars: 40, lampWarmth: 78 },
+    night: { visible: true, amount: 86, skyHue: 222, skySat: 20, skyDark: 78, horizonGlow: 40, stars: 40, lampWarmth: 78, ambient: 46 },
     base: { contrast: 10, saturation: -18, highlights: -14 },
     subject: { exposure: -14, temperature: -12, saturation: -10 },
     overlay: { opacity: 18, blend: "soft-light", saturation: -40, exposure: -20 },
-    finish: { vignette: 52, grain: 20, fade: 0, blacks: 34, shoulder: 46, contrast: 18 },
+    finish: { vignette: 30, grain: 18, fade: 0, blacks: 10, shoulder: 44, contrast: 14 },
     glow: { visible: true, count: 34, size: 26, spread: 62, cy: 64, intensity: 70, hue: 68 },
   },
   fireflies: {
     name: "Fireflies", icon: "🪰", match: 0.9,
-    night: { visible: true, amount: 78, skyHue: 230, skySat: 24, skyDark: 72, horizonGlow: 46, stars: 28, lampWarmth: 82 },
+    night: { visible: true, amount: 76, skyHue: 230, skySat: 24, skyDark: 72, horizonGlow: 46, stars: 28, lampWarmth: 82, ambient: 48 },
     base: { contrast: 8, saturation: -12, highlights: -10 },
     subject: { exposure: -10, temperature: -8 },
     overlay: { opacity: 14, blend: "soft-light", saturation: -30, exposure: -18 },
-    finish: { vignette: 46, grain: 16, fade: 0, blacks: 30, shoulder: 42, contrast: 16 },
+    finish: { vignette: 26, grain: 15, fade: 0, blacks: 8, shoulder: 40, contrast: 12 },
     glow: { visible: true, count: 90, size: 18, spread: 78, cy: 58, intensity: 85, hue: 62 },
   },
   noir: {
@@ -139,7 +139,7 @@ const state = {
     finish: { visible: true, vignette: 0, grain: 0, fade: 0, blacks: 0, shoulder: 0, contrast: 0 },
     glow: { visible: false, count: 0, size: 30, spread: 60, cy: 62, intensity: 65, hue: 68, seed: 7 },
     lights: [],
-    night: { visible: false, amount: 0, skyHue: 220, skySat: 22, skyDark: 78, skyDetail: 70, shadowCool: 18, lightWarm: 55, horizonGlow: 35, glowSide: 70, stars: 0, lampWarmth: 72, skyDetect: 50, skyFeather: 30, skyEdge: 70, seed: 3 },
+    night: { visible: false, amount: 0, skyHue: 220, skySat: 22, skyDark: 78, skyDetail: 70, shadowCool: 18, lightWarm: 55, horizonGlow: 35, glowSide: 70, stars: 0, lampWarmth: 72, skyDetect: 50, skyFeather: 30, skyEdge: 70, ambient: 42, seed: 3 },
     selectedId: null, zTop: 1, look: null,
     refine: { reach: 45, strength: 80, spill: 80 },
   },
@@ -698,32 +698,66 @@ function detectSky(img, { threshold = 50, feather = 30 } = {}) {
   morph(inSky, dil, closeR, 1);   // dilate
   morph(dil, cls, closeR, 0);     // erode
 
-  /* The fill halts on the gradient that PRECEDES the roofline, so it stops a
-     few pixels short and leaves a sliver of real sky on the ground side —
-     which then survives re-lighting as a bright fringe tracing the building.
-     Deliberately push the sky out past the edge; the guided filter that runs
-     next pulls it back onto the true boundary. Overshooting is safe there,
-     falling short is not. */
-  const over = new Uint8Array(N);
-  morph(cls, over, Math.max(2, Math.round(closeR * 1.6)), 1);
+  /* The fill's boundary is not trustworthy in either direction: it halts on
+     the gradient BEFORE a roofline (leaving sky on the ground side, which
+     survives as a bright fringe), and a blanket dilation to compensate
+     overshoots into thin foreground detail on other scenes.
 
+     So don't trust it. Build a trimap instead — eroded region is confidently
+     sky, dilated region is confidently not, and the band between is unknown.
+     The guided filter resolves the unknown band against the photograph, the
+     way the hair matte does. Nothing here is tuned to one image. */
+  const band = Math.max(2, Math.round(closeR * 1.4));
+  const sure = new Uint8Array(N), maybe = new Uint8Array(N);
+  morph(cls, sure, band, 0);      // erode  -> confidently sky
+  morph(cls, maybe, band, 1);     // dilate -> outside is confidently not sky
+
+  // 255 = sure sky, 0 = sure not-sky, 128 = unknown, resolved downstream.
   const m = cvOf(W, H);
   const mx = m.getContext("2d");
   const id = mx.createImageData(W, H);
+  let skyN = 0;
   for (let i = 0; i < N; i++) {
-    const v = over[i] ? 255 : 0;
+    const v = sure[i] ? 255 : (maybe[i] ? 128 : 0);
+    if (cls[i]) skyN++;
     id.data[i * 4] = id.data[i * 4 + 1] = id.data[i * 4 + 2] = v;
     id.data[i * 4 + 3] = 255;
   }
   mx.putImageData(id, 0, 0);
 
-  const f = cvOf(W, H);
-  const fx = f.getContext("2d");
-  // Always soften a little: this mask gets scaled up many times over for a
-  // full-resolution export, and a hard low-res edge tears when it does.
-  fx.filter = `blur(${((feather / 100) * Math.min(W, H) / 40 + 1.1).toFixed(2)}px)`;
-  fx.drawImage(m, 0, 0);
-  return f;
+  /* Universality guard. Not every photo has sky in it, and a fill seeded from
+     the top of an interior or a close-up will happily flood the whole frame.
+     Score what was found: sky should be a sensible share of the image, and
+     brighter and less saturated than the scene as a whole. A low score scales
+     the sky treatment down instead of wrecking the picture. */
+  const frac = skyN / N;
+  /* Scoring sky by "bright and desaturated" fails the moment a scene has a
+     sunset in it — that is saturated, and it is still sky. And penalising a
+     large detected fraction punishes photographs that genuinely are mostly
+     sky. Both were false negatives on real images.
+
+     Smoothness, height in frame, and brightness relative to the REST of the
+     picture hold up regardless of colour: sky has little texture, sits above
+     the horizon, and is lighter than what it silhouettes. */
+  let skyL = 0, skyG = 0, skyY = 0, sn = 0;
+  let othL = 0, othG = 0, on = 0;
+  for (let i = 0; i < N; i++) {
+    const y = (i / W) | 0;
+    if (cls[i]) { skyL += lum[i]; skyG += grad[i]; skyY += y / H; sn++; }
+    else { othL += lum[i]; othG += grad[i]; on++; }
+  }
+  let conf = 0;
+  if (frac >= 0.004 && frac <= 0.985 && sn && on) {
+    const brighter = clamp(((skyL / sn) - (othL / on)) / 0.16 + 0.5, 0, 1);
+    const smoother = clamp(((othG / on) - (skyG / sn)) / 0.012 + 0.5, 0, 1);
+    const higher   = clamp((0.62 - (skyY / sn)) / 0.30, 0, 1);
+    conf = clamp(smoother * 0.45 + brighter * 0.33 + higher * 0.22, 0, 1);
+    conf = clamp((conf - 0.22) / 0.5, 0, 1);      // decisive, not mushy
+  }
+  m._skyConfidence = conf;
+  m._skyFraction = frac;
+
+  return m;   // the trimap goes out raw; softening happens after matting
 }
 
 /* Replace the sky, sink the ground into night, and leave artificial light
@@ -804,7 +838,10 @@ function applyNight(id, W, H, skyData, N) {
       const kk = k * (1 - sky) * (1 - protect * 0.88);
 
       if (kk > 0) {
-        const mul = 1 - kk * 0.74;
+        // Real night has skylight fill: shadows go dark, not to zero. Without
+        // a floor the foreground of every scene blocks up solid black.
+        const amb = (N.ambient ?? 22) / 100;
+        const mul = 1 - kk * 0.74 * (1 - amb * 0.42);
         r *= mul; g *= mul; b *= mul;
         const L2 = 0.2126 * r + 0.7152 * g + 0.0722 * b;
         r += (L2 - r) * kk * 0.5;            // night vision desaturates…
@@ -816,6 +853,8 @@ function applyNight(id, W, H, skyData, N) {
         const deep = 1 - clamp(L2 / 0.42, 0, 1);
         const cool = kk * deep * ((N.shadowCool ?? 18) / 100) * 0.30;
         b += cool; r -= cool * 0.7; g -= cool * 0.2;
+        const fill = amb * kk * 0.16;                // cool skylight in the shade
+        r += fill * 0.72; g += fill * 0.85; b += fill;
         const lit = clamp((L2 - 0.30) / 0.70, 0, 1);
         const warm = kk * lit * ((N.lightWarm ?? 55) / 100) * 0.16;
         r += warm; g += warm * 0.42; b -= warm * 0.28;
@@ -1070,10 +1109,13 @@ function skyDataAt(W, H) {
 
   const n = w * h;
   const guide = new Float32Array(n), mask = new Float32Array(n);
+  const sure = new Uint8Array(n);            // 1 = sky, 2 = not sky, 0 = unknown
   for (let i = 0; i < n; i++) {
     const j = i * 4;
     guide[i] = (0.2126 * gd[j] + 0.7152 * gd[j + 1] + 0.0722 * gd[j + 2]) / 255;
-    mask[i] = md[j] / 255;
+    const v = md[j];
+    sure[i] = v > 200 ? 1 : (v < 55 ? 2 : 0);
+    mask[i] = v > 200 ? 1 : (v < 55 ? 0 : 0.5);
   }
   const edge = (S.night.skyEdge ?? 70) / 100;
   const r = Math.max(2, Math.round((1.6 + (1 - edge) * 9) * Math.min(w, h) / 380));
@@ -1083,9 +1125,13 @@ function skyDataAt(W, H) {
   // partially treated as ground, which reads as a dark halo hugging every
   // building. Steepening the ramp about its midpoint keeps the sub-pixel
   // edge the guide found while collapsing the transition to a few pixels.
-  const band = 0.07 + (1 - edge) * 0.33;
-  const lo = 0.5 - band, span = Math.max(1e-4, band * 2);
+  // Known regions are known: pin them, and let the solve stand only in the
+  // unknown band. This is what stops the matte drifting off real edges.
+  const bw = 0.07 + (1 - edge) * 0.33;
+  const lo = 0.5 - bw, span = Math.max(1e-4, bw * 2);
   for (let i = 0; i < q.length; i++) {
+    if (sure[i] === 1) { q[i] = 1; continue; }
+    if (sure[i] === 2) { q[i] = 0; continue; }
     const t = clamp((q[i] - lo) / span, 0, 1);
     q[i] = t * t * (3 - 2 * t);
   }
@@ -1102,6 +1148,8 @@ function skyDataAt(W, H) {
   const c = cvOf(W, H);
   c.getContext("2d").drawImage(out, 0, 0, W, H);
   const data = c.getContext("2d").getImageData(0, 0, W, H).data;
+  const conf = skyMask()._skyConfidence ?? 1;
+  if (conf < 0.999) for (let i = 0; i < data.length; i += 4) data[i] *= conf;
   S._skyData = { sig, data };
   return data;
 }
@@ -2278,7 +2326,13 @@ function buildLayerStack() {
   /* 🌙 Night */
   host.appendChild(sectionCard({
     key: "night", icon: "🌙", title: "Night",
-    meta: S.night.visible && S.night.amount > 0 ? `${S.night.amount}%` : "off",
+    meta: (() => {
+      if (!S.night.visible || S.night.amount <= 0) return "off";
+      const c = S.base.img ? (skyMask()._skyConfidence ?? 1) : 1;
+      const f = S.base.img ? (skyMask()._skyFraction ?? 0) : 0;
+      if (c < 0.15) return `${S.night.amount}% · no sky found`;
+      return `${S.night.amount}% · sky ${Math.round(f * 100)}%${c < 0.7 ? " (unsure)" : ""}`;
+    })(),
     visible: S.night.visible,
     onToggle: () => { S.night.visible = !S.night.visible; S._an = null; autoMatchAll(); buildLayerStack(); rerender(); },
     actions: btnRow([
@@ -2303,6 +2357,7 @@ function buildLayerStack() {
         { k: "glowSide",    label: "Glow from",    min: 0, max: 100, hint: "left ↔ right" },
         { k: "stars",       label: "Stars",        min: 0, max: 100 },
         { k: "lampWarmth",  label: "Keep lamps lit", min: 0, max: 100, hint: "protects warm light" },
+        { k: "ambient",     label: "Ambient fill", min: 0, max: 100, hint: "keeps shadows off pure black" },
         { k: "shadowCool",  label: "Shadow coolness", min: 0, max: 100 },
         { k: "lightWarm",   label: "Highlight warmth", min: 0, max: 100, hint: "where the depth comes from" },
       ].forEach((sp) => b.appendChild(sliderRow(sp, S.night, nightChange)));
@@ -2742,7 +2797,7 @@ function newSession() {
     finish: { visible: true, vignette: 0, grain: 0, fade: 0, blacks: 0, shoulder: 0, contrast: 0 },
     glow: { visible: false, count: 0, size: 30, spread: 60, cy: 62, intensity: 65, hue: 68, seed: 7 },
     lights: [],
-    night: { visible: false, amount: 0, skyHue: 220, skySat: 22, skyDark: 78, skyDetail: 70, shadowCool: 18, lightWarm: 55, horizonGlow: 35, glowSide: 70, stars: 0, lampWarmth: 72, skyDetect: 50, skyFeather: 30, skyEdge: 70, seed: 3 },
+    night: { visible: false, amount: 0, skyHue: 220, skySat: 22, skyDark: 78, skyDetail: 70, shadowCool: 18, lightWarm: 55, horizonGlow: 35, glowSide: 70, stars: 0, lampWarmth: 72, skyDetect: 50, skyFeather: 30, skyEdge: 70, ambient: 42, seed: 3 },
     refine: { reach: 45, strength: 80, spill: 80 },
     selectedId: null, zTop: 1, look: null,
   };
