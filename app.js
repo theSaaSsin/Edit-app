@@ -139,7 +139,7 @@ const state = {
     finish: { visible: true, vignette: 0, grain: 0, fade: 0, blacks: 0, shoulder: 0, contrast: 0 },
     glow: { visible: false, count: 0, size: 30, spread: 60, cy: 62, intensity: 65, hue: 68, seed: 7 },
     lights: [],
-    night: { visible: false, amount: 0, skyHue: 220, skySat: 22, skyDark: 78, skyDetail: 70, shadowCool: 18, lightWarm: 55, horizonGlow: 35, glowSide: 70, stars: 0, lampWarmth: 72, skyDetect: 50, skyFeather: 30, seed: 3 },
+    night: { visible: false, amount: 0, skyHue: 220, skySat: 22, skyDark: 78, skyDetail: 70, shadowCool: 18, lightWarm: 55, horizonGlow: 35, glowSide: 70, stars: 0, lampWarmth: 72, skyDetect: 50, skyFeather: 30, skyEdge: 70, seed: 3 },
     selectedId: null, zTop: 1, look: null,
     refine: { reach: 45, strength: 80, spill: 80 },
   },
@@ -698,11 +698,20 @@ function detectSky(img, { threshold = 50, feather = 30 } = {}) {
   morph(inSky, dil, closeR, 1);   // dilate
   morph(dil, cls, closeR, 0);     // erode
 
+  /* The fill halts on the gradient that PRECEDES the roofline, so it stops a
+     few pixels short and leaves a sliver of real sky on the ground side —
+     which then survives re-lighting as a bright fringe tracing the building.
+     Deliberately push the sky out past the edge; the guided filter that runs
+     next pulls it back onto the true boundary. Overshooting is safe there,
+     falling short is not. */
+  const over = new Uint8Array(N);
+  morph(cls, over, Math.max(2, Math.round(closeR * 1.6)), 1);
+
   const m = cvOf(W, H);
   const mx = m.getContext("2d");
   const id = mx.createImageData(W, H);
   for (let i = 0; i < N; i++) {
-    const v = cls[i] ? 255 : 0;
+    const v = over[i] ? 255 : 0;
     id.data[i * 4] = id.data[i * 4 + 1] = id.data[i * 4 + 2] = v;
     id.data[i * 4 + 3] = 255;
   }
@@ -781,8 +790,16 @@ function applyNight(id, W, H, skyData, N) {
         sr = tint[0] * nl * 2.0; sg = tint[1] * nl * 2.0; sb = tint[2] * nl * 2.0;
       }
 
-      // Ground: how lamp-like is this pixel? Warm and bright survives.
-      const warm = clamp((r - b) * 2.4, 0, 1) * clamp((L - 0.34) / 0.66, 0, 1);
+      // Ground: how lamp-like is this pixel? Warm AND bright AND saturated.
+      // Chroma is what separates a real lamp from blown sky: sky is close to
+      // neutral, sodium light is not. Without this test, sky slivers that
+      // fall on the ground side of the matte get "protected" as if they were
+      // lamps and survive as a pale fringe around aerials and rooflines.
+      const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+      const chroma = mx > 0.02 ? (mx - mn) / mx : 0;
+      const warm = clamp((r - b) * 2.4, 0, 1)
+                 * clamp((L - 0.34) / 0.66, 0, 1)
+                 * clamp((chroma - 0.10) / 0.30, 0, 1);
       const protect = warm * keep;
       const kk = k * (1 - sky) * (1 - protect * 0.88);
 
@@ -985,6 +1002,43 @@ function applyLocalFix(id, fixData, amount) {
   return id;
 }
 
+/* Guided filter — snap a coarse mask onto the real edges of an image.
+
+   The sky matte is solved at low resolution and then blurred, which is
+   exactly what puts a soft bright rim along every roofline: the blur
+   carries sky over the top of the dark roof edge, and re-lighting turns
+   that into a glow tracing the building. Blurring harder makes it worse.
+
+   The fix is the same idea as the hair matting — let the photograph
+   decide where the edge is. For each window this solves the linear model
+   q = a·I + b that best explains the mask from the guide image, so the
+   output follows the roofline to the pixel while staying smooth across
+   flat sky. */
+function guidedFilter(guide, mask, W, H, r, eps) {
+  const N = W * H;
+  const I = guide, p = mask;
+  const Ip = new Float32Array(N), II = new Float32Array(N);
+  for (let i = 0; i < N; i++) { Ip[i] = I[i] * p[i]; II[i] = I[i] * I[i]; }
+
+  const mI = Float32Array.from(I), mP = Float32Array.from(p);
+  const mIp = Ip, mII = II;
+  boxBlur(mI, W, H, r, 1); boxBlur(mP, W, H, r, 1);
+  boxBlur(mIp, W, H, r, 1); boxBlur(mII, W, H, r, 1);
+
+  const a = new Float32Array(N), b = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    const varI = mII[i] - mI[i] * mI[i];
+    const covIp = mIp[i] - mI[i] * mP[i];
+    a[i] = covIp / (varI + eps);
+    b[i] = mP[i] - a[i] * mI[i];
+  }
+  boxBlur(a, W, H, r, 1); boxBlur(b, W, H, r, 1);
+
+  const q = new Float32Array(N);
+  for (let i = 0; i < N; i++) q[i] = clamp(a[i] * I[i] + b[i], 0, 1);
+  return q;
+}
+
 /* Sky detection is expensive, so it's cached against the image and the
    detection settings — not against the grade, which doesn't move the sky. */
 function skyMask() {
@@ -996,10 +1050,60 @@ function skyMask() {
   return canvas;
 }
 function skyDataAt(W, H) {
-  const m = skyMask();
+  const S = state.scene;
+  const sig = `${S.base.token}|${S.night.skyDetect}|${S.night.skyFeather}|${S.night.skyEdge}|${W}x${H}`;
+  if (S._skyData && S._skyData.sig === sig) return S._skyData.data;
+
+  // Refine at a working resolution: the guide only has to resolve the
+  // roofline, and a full-resolution solve on an 8MP export is wasted work.
+  const cap = 1500;
+  const sc = Math.min(1, cap / Math.max(W, H));
+  const w = Math.max(8, Math.round(W * sc)), h = Math.max(8, Math.round(H * sc));
+
+  const mc = cvOf(w, h);
+  mc.getContext("2d").drawImage(skyMask(), 0, 0, w, h);
+  const md = mc.getContext("2d").getImageData(0, 0, w, h).data;
+
+  const gc = cvOf(w, h);
+  gc.getContext("2d").drawImage(S.base.img, 0, 0, w, h);
+  const gd = gc.getContext("2d").getImageData(0, 0, w, h).data;
+
+  const n = w * h;
+  const guide = new Float32Array(n), mask = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const j = i * 4;
+    guide[i] = (0.2126 * gd[j] + 0.7152 * gd[j + 1] + 0.0722 * gd[j + 2]) / 255;
+    mask[i] = md[j] / 255;
+  }
+  const edge = (S.night.skyEdge ?? 70) / 100;
+  const r = Math.max(2, Math.round((1.6 + (1 - edge) * 9) * Math.min(w, h) / 380));
+  const eps = 0.0004 + Math.pow(1 - edge, 2) * 0.02;
+  const q = guidedFilter(guide, mask, w, h, r, eps);
+  // The filter leaves a soft ramp the width of its window. Partial sky gets
+  // partially treated as ground, which reads as a dark halo hugging every
+  // building. Steepening the ramp about its midpoint keeps the sub-pixel
+  // edge the guide found while collapsing the transition to a few pixels.
+  const band = 0.07 + (1 - edge) * 0.33;
+  const lo = 0.5 - band, span = Math.max(1e-4, band * 2);
+  for (let i = 0; i < q.length; i++) {
+    const t = clamp((q[i] - lo) / span, 0, 1);
+    q[i] = t * t * (3 - 2 * t);
+  }
+
+  const out = cvOf(w, h);
+  const oid = out.getContext("2d").createImageData(w, h);
+  for (let i = 0; i < n; i++) {
+    const v = q[i] * 255;
+    oid.data[i * 4] = oid.data[i * 4 + 1] = oid.data[i * 4 + 2] = v;
+    oid.data[i * 4 + 3] = 255;
+  }
+  out.getContext("2d").putImageData(oid, 0, 0);
+
   const c = cvOf(W, H);
-  c.getContext("2d").drawImage(m, 0, 0, W, H);
-  return c.getContext("2d").getImageData(0, 0, W, H).data;
+  c.getContext("2d").drawImage(out, 0, 0, W, H);
+  const data = c.getContext("2d").getImageData(0, 0, W, H).data;
+  S._skyData = { sig, data };
+  return data;
 }
 function drawStars(ctx, W, H, N) {
   const count = Math.round((N.stars / 100) * 1100);
@@ -1262,10 +1366,10 @@ function renderComposite(targetW, opts = {}) {
     // The mask carries sky in its RGB with alpha opaque everywhere, so it has
     // to be converted to alpha before it can tint anything.
     const m = cvOf(W, H); const mx2 = m.getContext("2d");
-    mx2.drawImage(skyMask(), 0, 0, W, H);
-    const mid = mx2.getImageData(0, 0, W, H);
+    const sd = skyDataAt(W, H);
+    const mid = mx2.createImageData(W, H);
     for (let i = 0; i < mid.data.length; i += 4) {
-      mid.data[i + 3] = mid.data[i];
+      mid.data[i + 3] = sd[i];
       mid.data[i] = 255; mid.data[i + 1] = 59; mid.data[i + 2] = 127;
     }
     mx2.putImageData(mid, 0, 0);
@@ -1727,6 +1831,7 @@ async function showScene(dataUrl) {
   state.scene.base.img = await loadImage(dataUrl);
   state.scene.base.token++;
   state.scene._an = null;
+  state.scene._sky = null; state.scene._skyData = null;
   buildLayerStack(); scheduleRender(); positionOverlay(); updateSceneButtons();
 }
 async function setOverlay(file) {
@@ -2205,7 +2310,8 @@ function buildLayerStack() {
       [
         { k: "skyDetect",  label: "Spread",  min: 0, max: 100, hint: "how far the fill runs" },
         { k: "skyFeather", label: "Softness", min: 0, max: 100 },
-      ].forEach((sp) => b.appendChild(sliderRow(sp, S.night, () => { S._sky = null; nightChange(); })));
+        { k: "skyEdge",    label: "Edge snap", min: 0, max: 100, hint: "follow the roofline" },
+      ].forEach((sp) => b.appendChild(sliderRow(sp, S.night, () => { S._sky = null; S._skyData = null; nightChange(); })));
     },
   }));
 
@@ -2636,7 +2742,7 @@ function newSession() {
     finish: { visible: true, vignette: 0, grain: 0, fade: 0, blacks: 0, shoulder: 0, contrast: 0 },
     glow: { visible: false, count: 0, size: 30, spread: 60, cy: 62, intensity: 65, hue: 68, seed: 7 },
     lights: [],
-    night: { visible: false, amount: 0, skyHue: 220, skySat: 22, skyDark: 78, skyDetail: 70, shadowCool: 18, lightWarm: 55, horizonGlow: 35, glowSide: 70, stars: 0, lampWarmth: 72, skyDetect: 50, skyFeather: 30, seed: 3 },
+    night: { visible: false, amount: 0, skyHue: 220, skySat: 22, skyDark: 78, skyDetail: 70, shadowCool: 18, lightWarm: 55, horizonGlow: 35, glowSide: 70, stars: 0, lampWarmth: 72, skyDetect: 50, skyFeather: 30, skyEdge: 70, seed: 3 },
     refine: { reach: 45, strength: 80, spill: 80 },
     selectedId: null, zTop: 1, look: null,
   };
