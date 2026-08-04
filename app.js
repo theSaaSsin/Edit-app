@@ -48,6 +48,9 @@ const SHADOW_ROWS = [
   { k: "contact", label: "Contact shadow", min: 0, max: 100, hint: "grounds the subject" },
 ];
 const FINISH_ROWS = [
+  { k: "blacks",   label: "Black point", min: 0, max: 100, hint: "crush to true black" },
+  { k: "shoulder", label: "Highlight roll-off", min: 0, max: 100, hint: "hold the highlights down" },
+  { k: "contrast", label: "Filmic contrast", min: -100, max: 100 },
   { k: "vignette", label: "Vignette", min: 0, max: 100 },
   { k: "grain",    label: "Grain",    min: 0, max: 100 },
   { k: "fade",     label: "Faded blacks", min: 0, max: 100 },
@@ -102,7 +105,7 @@ const LOOKS = {
     base: { contrast: 10, saturation: -18, highlights: -14 },
     subject: { exposure: -14, temperature: -12, saturation: -10 },
     overlay: { opacity: 18, blend: "soft-light", saturation: -40, exposure: -20 },
-    finish: { vignette: 52, grain: 20, fade: 4 },
+    finish: { vignette: 52, grain: 20, fade: 0, blacks: 34, shoulder: 46, contrast: 18 },
     glow: { visible: true, count: 34, size: 26, spread: 62, cy: 64, intensity: 70, hue: 68 },
   },
   fireflies: {
@@ -111,7 +114,7 @@ const LOOKS = {
     base: { contrast: 8, saturation: -12, highlights: -10 },
     subject: { exposure: -10, temperature: -8 },
     overlay: { opacity: 14, blend: "soft-light", saturation: -30, exposure: -18 },
-    finish: { vignette: 46, grain: 16, fade: 6 },
+    finish: { vignette: 46, grain: 16, fade: 0, blacks: 30, shoulder: 42, contrast: 16 },
     glow: { visible: true, count: 90, size: 18, spread: 78, cy: 58, intensity: 85, hue: 62 },
   },
   noir: {
@@ -133,10 +136,10 @@ const state = {
     base: { img: null, adj: newAdj(), visible: true, token: 0 },
     layers: [],
     overlay: { dataUrl: null, img: null, visible: true, blend: "soft-light", opacity: 40, rot: 0, flipH: false, adj: newAdj() },
-    finish: { visible: true, vignette: 0, grain: 0, fade: 0 },
+    finish: { visible: true, vignette: 0, grain: 0, fade: 0, blacks: 0, shoulder: 0, contrast: 0 },
     glow: { visible: false, count: 0, size: 30, spread: 60, cy: 62, intensity: 65, hue: 68, seed: 7 },
     lights: [],
-    night: { visible: false, amount: 0, skyHue: 220, skySat: 22, skyDark: 78, skyDetail: 70, horizonGlow: 35, glowSide: 70, stars: 0, lampWarmth: 72, skyDetect: 50, skyFeather: 30, seed: 3 },
+    night: { visible: false, amount: 0, skyHue: 220, skySat: 22, skyDark: 78, skyDetail: 70, shadowCool: 18, lightWarm: 55, horizonGlow: 35, glowSide: 70, stars: 0, lampWarmth: 72, skyDetect: 50, skyFeather: 30, seed: 3 },
     selectedId: null, zTop: 1, look: null,
     refine: { reach: 45, strength: 80, spill: 80 },
   },
@@ -794,8 +797,11 @@ function applyNight(id, W, H, skyData, N) {
         // against cool shadow is what gives a night frame its depth; a flat
         // sepia wash over everything is what kills it.
         const deep = 1 - clamp(L2 / 0.42, 0, 1);
-        const cool = kk * (0.03 + deep * 0.085);
-        b += cool; r -= cool * 0.75; g -= cool * 0.22;
+        const cool = kk * deep * ((N.shadowCool ?? 18) / 100) * 0.30;
+        b += cool; r -= cool * 0.7; g -= cool * 0.2;
+        const lit = clamp((L2 - 0.30) / 0.70, 0, 1);
+        const warm = kk * lit * ((N.lightWarm ?? 55) / 100) * 0.16;
+        r += warm; g += warm * 0.42; b -= warm * 0.28;
       }
       if (sky > 0) {
         const ks = k * sky;
@@ -1277,13 +1283,29 @@ function renderComposite(targetW, opts = {}) {
       g.addColorStop(1, `rgba(0,0,0,${(k * 0.82).toFixed(3)})`);
       ctx.save(); ctx.fillStyle = g; ctx.fillRect(0, 0, W, H); ctx.restore();
     }
-    if (F.grain > 0 || F.fade > 0) {
+    const blacks = (F.blacks || 0) / 100, shoulder = (F.shoulder || 0) / 100, fcon = (F.contrast || 0) / 100;
+    if (F.grain > 0 || F.fade > 0 || blacks || shoulder || fcon) {
       const id = ctx.getImageData(0, 0, W, H);
       const d = id.data;
       const grain = F.grain / 100, fade = F.fade / 100;
       const lift = fade * 0.20, mul = 1 - fade * 0.16;
+      const bp = blacks * 0.16;
+      const sh = shoulder * 3.4;
+      const knee = 0.42;
+      const tone = (v) => {
+        if (bp) v = (v - bp) / (1 - bp);              // set the black point
+        if (v < 0) v = 0;
+        if (sh && v > knee) v = knee + (v - knee) / (1 + sh * (v - knee));   // bend only the top
+        if (fcon) {                                   // S-curve about the midtone
+          const t = clamp(v, 0, 1);
+          const s2 = t * t * (3 - 2 * t);
+          v = v + (s2 - t) * fcon;
+        }
+        return v;
+      };
       for (let i = 0; i < d.length; i += 4) {
         let r = d[i] / 255, g2 = d[i + 1] / 255, b = d[i + 2] / 255;
+        if (bp || sh || fcon) { r = tone(r); g2 = tone(g2); b = tone(b); }
         if (fade) { r = r * mul + lift; g2 = g2 * mul + lift; b = b * mul + lift; }
         if (grain) {
           const L = 0.2126 * r + 0.7152 * g2 + 0.0722 * b;
@@ -2176,6 +2198,8 @@ function buildLayerStack() {
         { k: "glowSide",    label: "Glow from",    min: 0, max: 100, hint: "left ↔ right" },
         { k: "stars",       label: "Stars",        min: 0, max: 100 },
         { k: "lampWarmth",  label: "Keep lamps lit", min: 0, max: 100, hint: "protects warm light" },
+        { k: "shadowCool",  label: "Shadow coolness", min: 0, max: 100 },
+        { k: "lightWarm",   label: "Highlight warmth", min: 0, max: 100, hint: "where the depth comes from" },
       ].forEach((sp) => b.appendChild(sliderRow(sp, S.night, nightChange)));
       b.appendChild(groupLabel("Sky detection"));
       [
@@ -2609,10 +2633,10 @@ function newSession() {
     base: { img: null, adj: newAdj(), visible: true, token: 0 },
     layers: [],
     overlay: { dataUrl: null, img: null, visible: true, blend: "soft-light", opacity: 40, rot: 0, flipH: false, adj: newAdj() },
-    finish: { visible: true, vignette: 0, grain: 0, fade: 0 },
+    finish: { visible: true, vignette: 0, grain: 0, fade: 0, blacks: 0, shoulder: 0, contrast: 0 },
     glow: { visible: false, count: 0, size: 30, spread: 60, cy: 62, intensity: 65, hue: 68, seed: 7 },
     lights: [],
-    night: { visible: false, amount: 0, skyHue: 220, skySat: 22, skyDark: 78, skyDetail: 70, horizonGlow: 35, glowSide: 70, stars: 0, lampWarmth: 72, skyDetect: 50, skyFeather: 30, seed: 3 },
+    night: { visible: false, amount: 0, skyHue: 220, skySat: 22, skyDark: 78, skyDetail: 70, shadowCool: 18, lightWarm: 55, horizonGlow: 35, glowSide: 70, stars: 0, lampWarmth: 72, skyDetect: 50, skyFeather: 30, seed: 3 },
     refine: { reach: 45, strength: 80, spill: 80 },
     selectedId: null, zTop: 1, look: null,
   };
