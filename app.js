@@ -1026,7 +1026,7 @@ const newLight = (type = "sodium") => {
     x: 0.72, y: 0.3, radius: 42, intensity: 70,
     hue: t.hue, sat: t.sat, falloff: 55,
     beamAngle: 200, beamSpread: t.spread, airlight: 30,
-    shadows: 100, shadowSoft: 45,
+    shadows: 100, shadowSoft: 45, depthGap: 22,
   };
 };
 
@@ -1071,7 +1071,34 @@ function occluderBuffer(w, h) {
   return occ;
 }
 
-function shadowMapFor(occ, w, h, lxf, lyf, softness) {
+/* Depth. Without it the occluder march treats the whole photograph as one
+   flat plane, so a shadow slides across the ground, up the far wall and over
+   a mid wall as though they were coplanar — which is exactly what a yard
+   with walls at three different distances makes obvious.
+
+   No depth is inferred from the image. The default is a ground-plane prior
+   (lower in frame is nearer), which is right for most outdoor scenes, and
+   anything it gets wrong is painted: tap a wall, set how far away it is.
+   Shadows then refuse to cross a large depth gap, so a subject standing in
+   the foreground stops casting onto a building behind it. */
+function depthBuffer(w, h) {
+  const S = state.scene;
+  const d = new Float32Array(w * h);
+  if (S.depthMap) {
+    const c = cvOf(w, h);
+    c.getContext("2d").drawImage(S.depthMap, 0, 0, w, h);
+    const id = c.getContext("2d").getImageData(0, 0, w, h).data;
+    for (let i = 0; i < d.length; i++) d[i] = id[i * 4] / 255;
+  } else {
+    for (let y = 0; y < h; y++) {
+      const near = Math.pow(y / Math.max(1, h - 1), 0.85);   // bottom of frame = nearest
+      for (let x = 0; x < w; x++) d[y * w + x] = near;
+    }
+  }
+  return d;
+}
+
+function shadowMapFor(occ, w, h, lxf, lyf, softness, depth, depthGap) {
   const vis = new Float32Array(w * h);
   const lx = lxf * w, ly = lyf * h;
   const maxSteps = 54;
@@ -1090,12 +1117,22 @@ function shadowMapFor(occ, w, h, lxf, lyf, softness) {
          past the wall is in shade. Without this the blocker shades its own
          surface and a painted building goes darker than the open ground. */
       let inside = occ[i] > 0.02;
+      const dHere = depth ? depth[i] : 0;
       for (let s = 1; s <= n; s++) {
         const t = s / (n + 1);
         const sx = (x + dx * t) | 0, sy = (y + dy * t) | 0;
         if (sx < 0 || sy < 0 || sx >= w || sy >= h) break;
-        const o = occ[sy * w + sx];
+        const si = sy * w + sx;
+        const o = occ[si];
         if (inside) { if (o <= 0.02) inside = false; continue; }
+        if (o > 0.02 && depth) {
+          /* An occluder only shadows a surface at a comparable distance. A
+             person standing in the foreground does not darken a building
+             several gardens behind them, and without this test the shadow
+             smears across every wall in the frame regardless of depth. */
+          const gap = Math.abs(depth[si] - dHere);
+          if (gap > depthGap) continue;
+        }
         if (o > 0.02) {
           /* Weight by the distance each step covers, not per step: otherwise a
              thin wall blocks fully up close and barely at all far away, purely
@@ -1122,6 +1159,7 @@ function applyLights(id, W, H, lights, unit, skyData) {
   const sw2 = anyOcc ? Math.max(64, Math.min(240, Math.round(W / 8))) : 0;
   const sh2 = anyOcc ? Math.max(64, Math.round(sw2 * (H / W))) : 0;
   const occ = anyOcc ? occluderBuffer(sw2, sh2) : null;
+  const dep = anyOcc ? depthBuffer(sw2, sh2) : null;
 
   // Precompute per-light constants so the inner loop stays cheap.
   const P = live.map((l) => {
@@ -1138,7 +1176,7 @@ function applyLights(id, W, H, lights, unit, skyData) {
       dir: ((l.beamAngle || 0) * Math.PI) / 180,
       half: ((l.beamSpread || 360) / 2) * (Math.PI / 180),
       shadow: (occ && (l.shadows ?? 100) > 0)
-        ? shadowMapFor(occ, sw2, sh2, l.x, l.y, l.shadowSoft ?? 45)
+        ? shadowMapFor(occ, sw2, sh2, l.x, l.y, l.shadowSoft ?? 45, dep, ((l.depthGap ?? 22) / 100))
         : null,
       shAmt: (l.shadows ?? 100) / 100,
     };
@@ -1721,8 +1759,9 @@ function renderComposite(targetW, opts = {}) {
   if (state.brush.on && state.brush.showMask && S.base.img) {
     let md = null;
     if (state.brush.target === "sky") md = skyDataAt(W, H);
-    else if (state.brush.target === "blocker") {
-      const oc = cvOf(W, H); oc.getContext("2d").drawImage(ensureOccluder(), 0, 0, W, H);
+    else if (state.brush.target === "blocker" || state.brush.target === "depth") {
+      const srcC = state.brush.target === "depth" ? ensureDepth() : ensureOccluder();
+      const oc = cvOf(W, H); oc.getContext("2d").drawImage(srcC, 0, 0, W, H);
       md = oc.getContext("2d").getImageData(0, 0, W, H).data;
     }
     else {
@@ -2363,6 +2402,7 @@ const MASK_TARGETS = {
   subject: { icon: "🧍", name: "Subject" },
   sky:     { icon: "🌌", name: "Sky" },
   blocker: { icon: "🧱", name: "Blockers" },
+  depth:   { icon: "🪜", name: "Depth" },
 };
 const isWand = (t) => t === "wandAdd" || t === "wandSub";
 
@@ -2380,6 +2420,27 @@ const isWand = (t) => t === "wandAdd" || t === "wandSub";
    it, so re-detecting or moving the detection sliders never throws away
    hand corrections.
    ============================================================ */
+function ensureDepth() {
+  const S = state.scene;
+  if (!S.base.img) return null;
+  const w = 320, h = Math.max(8, Math.round(w * (S.base.img.naturalHeight / S.base.img.naturalWidth)));
+  if (!S.depthMap || S.depthMap.width !== w) {
+    const c = cvOf(w, h);
+    const x = c.getContext("2d");
+    // Seed with the ground-plane prior so painting only has to correct it.
+    const g = x.createLinearGradient(0, 0, 0, h);
+    g.addColorStop(0, "#000"); g.addColorStop(1, "#fff");
+    x.fillStyle = g; x.fillRect(0, 0, w, h);
+    S.depthMap = c;
+  }
+  return S.depthMap;
+}
+function pointToDepth(clientX, clientY) {
+  const r = dom.layerOverlay.getBoundingClientRect();
+  const m = ensureDepth();
+  return { x: ((clientX - r.left) / r.width) * m.width, y: ((clientY - r.top) / r.height) * m.height };
+}
+
 function ensureOccluder() {
   const S = state.scene;
   if (!S.base.img) return null;
@@ -2476,8 +2537,8 @@ function growRegion(srcImg, W, H, pt, tolPct, sizePct) {
   return { out, n };
 }
 
-function wandBlocker(pt, add) {
-  const c = ensureOccluder();
+function wandFlat(t, pt, add) {
+  const c = t.canvas;
   const W = c.width, H = c.height;
   const { out, n } = growRegion(state.scene.base.img, W, H, pt, state.brush.strength, state.brush.size);
   const ctx = c.getContext("2d");
@@ -2486,7 +2547,9 @@ function wandBlocker(pt, add) {
   for (let i = 0; i < out.length; i++) { if (!out[i]) continue; const j = i * 4; id.data[j] = id.data[j + 1] = id.data[j + 2] = v; }
   ctx.putImageData(id, 0, 0);
   scheduleRender();
-  toast(`🧱 ${add ? "Marked" : "Cleared"} ${Math.round((n / (W * H)) * 100)}% as a light blocker`);
+  toast(t.kind === "depth"
+    ? `🪜 Moved ${Math.round((n / (W * H)) * 100)}% of the frame ${add ? "nearer" : "further away"}`
+    : `🧱 ${add ? "Marked" : "Cleared"} ${Math.round((n / (W * H)) * 100)}% as a light blocker`);
 }
 
 function wandSubject(L, pt, add) {
@@ -2577,6 +2640,10 @@ function maskTarget() {
     if (!S.base.img) return null;
     return { kind: "blocker", canvas: ensureOccluder(), src: S.base.img };
   }
+  if (state.brush.target === "depth") {
+    if (!S.base.img) return null;
+    return { kind: "depth", canvas: ensureDepth(), src: S.base.img };
+  }
   const L = S.layers.find((x) => x.id === S.selectedId) || (S.layers.length === 1 ? S.layers[0] : null);
   if (!L) return null;
   return { kind: "subject", layer: L, canvas: L.mask, src: L.src };
@@ -2584,12 +2651,15 @@ function maskTarget() {
 function targetPoint(t, cx, cy) {
   if (t.kind === "sky") return pointToSky(cx, cy);
   if (t.kind === "blocker") return pointToOccluder(cx, cy);
+  if (t.kind === "depth") return pointToDepth(cx, cy);
   return pointToMask(t.layer, cx, cy);
 }
-/* Blockers paint like any other mask, straight into the occluder buffer. */
-function paintBlocker(from, to) {
+/* Blockers and depth paint like any other mask, straight into their buffer.
+   For depth, white is near and black is far, so "add" brings a surface
+   forward and "remove" pushes it back. */
+function paintFlat(t, from, to) {
   const B = state.brush;
-  const c = ensureOccluder();
+  const c = t.canvas;
   if (isDodgeBurn(B.tool)) { dodgeBurnStroke(c, from, to); scheduleRender(); return; }
   const ctx = c.getContext("2d");
   const radius = Math.max(1, (B.size / 100) * Math.min(c.width, c.height) * 0.35);
@@ -2688,7 +2758,7 @@ function startPaint(e) {
   painting = { t, last: p, startX: e.clientX, startY: e.clientY, moved: false, tool: state.brush.tool };
   if (!isWand(painting.tool)) {
     if (t.kind === "sky") paintSky(p, p);
-    else if (t.kind === "blocker") paintBlocker(p, p);
+    else if (t.kind === "blocker" || t.kind === "depth") paintFlat(t, p, p);
     else paintAt(t.layer, p, p);
     scheduleRender();
   }
@@ -2703,7 +2773,7 @@ function movePaint(e) {
   if (isWand(painting.tool)) return;          // a wand acts on release, not on drag
   const p = targetPoint(painting.t, e.clientX, e.clientY);
   if (painting.t.kind === "sky") paintSky(painting.last, p);
-  else if (painting.t.kind === "blocker") paintBlocker(painting.last, p);
+  else if (painting.t.kind === "blocker" || painting.t.kind === "depth") paintFlat(painting.t, painting.last, p);
   else paintAt(painting.t.layer, painting.last, p);
   painting.last = p;
   scheduleRender();
@@ -2716,7 +2786,7 @@ function endPaint(e) {
   if (p && isWand(p.tool) && !p.moved) {
     const add = p.tool === "wandAdd";
     if (p.t.kind === "sky") wandSky(p.last, add);
-    else if (p.t.kind === "blocker") wandBlocker(p.last, add);
+    else if (p.t.kind === "blocker" || p.t.kind === "depth") wandFlat(p.t, p.last, add);
     else wandSubject(p.t.layer, p.last, add);
     buildBrushBar();
   }
@@ -3056,6 +3126,7 @@ function buildLayerStack() {
           { k: "airlight",  label: "Haze",       min: 0, max: 100, hint: "glow in the air" },
           { k: "shadows",   label: "Casts shadows", min: 0, max: 100, hint: "blocked by subjects & blockers" },
           { k: "shadowSoft", label: "Shadow softness", min: 0, max: 100 },
+          { k: "depthGap",  label: "Shadow depth reach", min: 2, max: 100, hint: "how far in depth a shadow carries" },
         ];
         if (lt.beamSpread < 359) {
           rows.push({ k: "beamAngle",  label: "Beam aim",   min: 0, max: 359, unit: "°" });
@@ -3376,6 +3447,9 @@ function buildBrushBar() {
   if (B.target === "blocker") {
     add("↺ Clear blockers", () => { state.scene.occluder = null; ensureOccluder(); scheduleRender(); toast("Blockers cleared."); });
   }
+  if (B.target === "depth") {
+    add("↺ Reset to ground plane", () => { state.scene.depthMap = null; ensureDepth(); scheduleRender(); toast("Depth reset — near at the bottom of frame."); });
+  }
   if (B.target === "sky") {
     add("↺ Reset sky edits", () => {
       state.scene.skyEdit = null; ensureSkyEdit(); skyEditDirty();
@@ -3404,6 +3478,7 @@ function buildBrushBar() {
   hint.className = "brush-hint";
   const what = B.target === "sky" ? "the sky mask"
              : B.target === "blocker" ? "what blocks light — walls, fences, cars"
+             : B.target === "depth" ? "how far away things are — add = nearer, remove = further"
              : (L ? `“${L.name}”` : null);
   hint.textContent = what
     ? `${isWand(B.tool) ? "Tap" : "Drag"} on the image — ${BRUSH_TOOLS[B.tool].hint}. Editing ${what}.`
