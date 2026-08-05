@@ -1091,9 +1091,19 @@ function applyLights(id, W, H, lights, unit, skyData) {
         }
       }
       let r = d[i4] / 255, g = d[i4 + 1] / 255, b = d[i4 + 2] / 255;
+      /* Gain alone drives anything bright near a lamp straight past 1 and it
+         clips flat white — a subject standing under a light lost its whole
+         upper body. Roll the result off instead, so extra light keeps adding
+         detail into the highlights instead of welding them shut. */
       r = r * (1 + gr * 2.6) + ar * 0.5;   // multiplicative on albedo…
       g = g * (1 + gg * 2.6) + ag * 0.5;   // …plus a little air
       b = b * (1 + gb * 2.6) + ab * 0.5;
+      const peak2 = Math.max(r, g, b);
+      if (peak2 > 0.72) {
+        const rolled = 0.72 + (peak2 - 0.72) / (1 + (peak2 - 0.72) * 2.2);
+        const k2 = rolled / peak2;
+        r *= k2; g *= k2; b *= k2;
+      }
       d[i4]     = r <= 0 ? 0 : r >= 1 ? 255 : r * 255;
       d[i4 + 1] = g <= 0 ? 0 : g >= 1 ? 255 : g * 255;
       d[i4 + 2] = b <= 0 ? 0 : b >= 1 ? 255 : b * 255;
@@ -1352,8 +1362,20 @@ function drawStars(ctx, W, H, N) {
     tx.fillStyle = `rgba(255,255,${Math.round(232 + rnd() * 23)},${(b * 0.9).toFixed(3)})`;
     tx.beginPath(); tx.arc(x, y, r, 0, Math.PI * 2); tx.fill();
   }
-  tx.globalCompositeOperation = "destination-in";   // stars only in the sky
-  tx.drawImage(skyMask(), 0, 0, W, H);
+  /* The sky mask stores its value in RGB with alpha opaque everywhere, so
+     using it directly as a destination-in clip keeps everything — stars were
+     landing on brickwork and wheelie bins. Convert it to alpha first. */
+  const sd = skyDataAt(W, H);
+  const clip = cvOf(W, H);
+  const cx2 = clip.getContext("2d");
+  const cid = cx2.createImageData(W, H);
+  for (let i = 0; i < cid.data.length; i += 4) {
+    cid.data[i] = cid.data[i + 1] = cid.data[i + 2] = 255;
+    cid.data[i + 3] = sd[i];
+  }
+  cx2.putImageData(cid, 0, 0);
+  tx.globalCompositeOperation = "destination-in";
+  tx.drawImage(clip, 0, 0);
   ctx.save(); ctx.globalCompositeOperation = "lighter"; ctx.drawImage(tmp, 0, 0); ctx.restore();
 }
 
