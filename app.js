@@ -2006,26 +2006,60 @@ function solveNightField(ctx, W, H, NS) {
       openness[i] = Math.exp(-dist / canyon);
     }
   }
+  /* Painted correction to how much sky a surface sees. The column march is a
+     crude horizon and it has no idea about a recess, a soffit or a wall facing
+     away, so this is where you say so. */
+  const readPaint = (cv) => {
+    if (!cv) return null;
+    const c = cvOf(w, h);
+    c.getContext("2d").drawImage(cv, 0, 0, w, h);
+    return c.getContext("2d").getImageData(0, 0, w, h).data;
+  };
+  const openPd = readPaint(S.openPaint);
+  if (openPd) {
+    for (let i = 0; i < n; i++) {
+      const e = (openPd[i * 4] - 128) / 127;
+      if (e > 0.004) openness[i] = openness[i] + (1 - openness[i]) * e;
+      else if (e < -0.004) openness[i] = openness[i] * (1 + e);
+    }
+  }
 
   /* 3 — the emitters. Windows and placed lights are the only things actually
      making light at night, and inverse-square is what makes the falloff read
      as light rather than as an airbrushed blob. */
   const em = new Float32Array(n * 3);
-  const addEmitter = (fx, fy, rad, gain, hue, sat) => {
+  /* Occlusion belongs in the field, not just in the drawn glow. A lamp behind
+     a wall must not bounce light onto what is in front of the wall, and a
+     subject standing in front of a window must leave its own dark side. The
+     ray-march and the depth map are already built for the drawn lights, so
+     the solve borrows them rather than inventing a second answer. */
+  const anyOcc = !!(S.occluder || S.layers.some((L) => L.visible && L.blocksLight !== false));
+  const ow = anyOcc ? Math.max(48, Math.min(200, Math.round(w / 2))) : 0;
+  const oh = anyOcc ? Math.max(48, Math.round(ow * (h / w))) : 0;
+  const occ = anyOcc ? occluderBuffer(ow, oh) : null;
+  const dep = anyOcc ? depthBuffer(ow, oh) : null;
+
+  const addEmitter = (fx, fy, rad, gain, hue, sat, shade) => {
     if (gain <= 0) return;
     const [er, eg, eb] = hsl2rgb((((hue % 360) + 360) % 360) / 360, clamp(sat / 100, 0, 1), 0.58);
     const cx = fx * w, cy = fy * h;
     const rr = Math.max(2, rad * Math.max(w, h));
     const reach = rr * 5;
+    const vis = (shade && occ) ? shadowMapFor(occ, ow, oh, fx, fy, 45, dep, 0.22) : null;
     const x0 = Math.max(0, Math.floor(cx - reach)), x1 = Math.min(w - 1, Math.ceil(cx + reach));
     const y0 = Math.max(0, Math.floor(cy - reach)), y1 = Math.min(h - 1, Math.ceil(cy + reach));
     for (let y = y0; y <= y1; y++) {
       for (let x = x0; x <= x1; x++) {
         const dx = x - cx, dy = y - cy;
         const d2 = (dx * dx + dy * dy) / (rr * rr);
-        const f = gain / (1 + d2 * 5.5);
+        let f = gain / (1 + d2 * 5.5);
         if (f < 0.002) continue;
-        const i = (y * w + x) * 3;
+        const p = y * w + x;
+        if (vis) {
+          const vx = Math.min(ow - 1, (x * ow / w) | 0), vy = Math.min(oh - 1, (y * oh / h) | 0);
+          f *= vis[vy * ow + vx];
+        }
+        const i = p * 3;
         em[i] += f * er; em[i + 1] += f * eg; em[i + 2] += f * eb;
       }
     }
@@ -2038,13 +2072,13 @@ function solveNightField(ctx, W, H, NS) {
     for (const win of WN.list) {
       if (!win.on) continue;
       const jit = 1 - (WN.variation / 100) * rnd();
-      addEmitter(win.x, win.y, Math.max(win.w, win.h) * 0.9, g * jit, 34 + WN.warmth * 0.12, 55 + WN.warmth * 0.25);
+      addEmitter(win.x, win.y, Math.max(win.w, win.h) * 0.9, g * jit, 34 + WN.warmth * 0.12, 55 + WN.warmth * 0.25, false);
     }
   }
   for (const lt of S.lights) {
     if (!lt.visible) continue;
     const t = LIGHT_TYPES[lt.type] || LIGHT_TYPES.sodium;
-    addEmitter(lt.x, lt.y, (lt.radius / 100) * 0.32, (lt.intensity / 100) * (NS.lampGain / 100) * 1.15, t.hue, t.sat);
+    addEmitter(lt.x, lt.y, (lt.radius / 100) * 0.32, (lt.intensity / 100) * (NS.lampGain / 100) * 1.15, t.hue, t.sat, (lt.shadows ?? 100) > 0);
   }
 
   /* 4 — assemble, and divide the daylight out. */
@@ -2081,6 +2115,19 @@ function solveNightField(ctx, W, H, NS) {
       const pl = 0.2126 * pd[i * 4] + 0.7152 * pd[i * 4 + 1] + 0.0722 * pd[i * 4 + 2];
       const rl = 0.2126 * ratio[i * 3] + 0.7152 * ratio[i * 3 + 1] + 0.0722 * ratio[i * 3 + 2];
       pred[i] = pl * rl;
+    }
+    /* Painted light goes on before the auto-exposure reads the frame, so
+       brushing a wall brighter moves that wall rather than quietly stopping
+       the rest of the picture down to compensate. */
+    const lightPd = readPaint(S.lightPaint);
+    if (lightPd) {
+      for (let i = 0; i < n; i++) {
+        const e = (lightPd[i * 4] - 128) / 127;
+        if (Math.abs(e) < 0.004) continue;
+        const g2 = Math.pow(2, e * 2.6);       // +/- 2.6 stops at full brush
+        for (let c = 0; c < 3; c++) ratio[i * 3 + c] = clamp(ratio[i * 3 + c] * g2, 0.006, 10);
+        pred[i] *= g2;
+      }
     }
     const srt = Array.from(pred).sort((a, b) => a - b);
     const med = Math.max(0.5, srt[srt.length >> 1]);
@@ -2947,6 +2994,8 @@ const MASK_TARGETS = {
   blocker: { icon: "🧱", name: "Blockers" },
   depth:   { icon: "🪜", name: "Depth" },
   window:  { icon: "🪟", name: "Windows" },
+  light:   { icon: "🔦", name: "Light" },
+  open:    { icon: "🕳", name: "Sky reach" },
 };
 const isWand = (t) => t === "wandAdd" || t === "wandSub";
 
@@ -2982,6 +3031,48 @@ function ensureDepth() {
 function pointToDepth(clientX, clientY) {
   const r = dom.layerOverlay.getBoundingClientRect();
   const m = ensureDepth();
+  return { x: ((clientX - r.left) / r.width) * m.width, y: ((clientY - r.top) / r.height) * m.height };
+}
+
+/* Painting the solve. The renderer's job is to get a scene most of the way;
+   the last stretch is judgement, and judgement is faster to paint than to
+   parameterise. Each of these is a separate stage of the light rather than
+   one catch-all brush, because "this wall should catch more of the lamp" and
+   "this alcove sees no sky" are different statements and collapsing them into
+   a single slider is how you end up unable to say either.
+
+   Both store 128 as neutral, so an untouched map changes nothing and the
+   painting is a signed correction rather than a replacement. */
+function ensureLightPaint() {
+  const S = state.scene;
+  if (!S.base.img) return null;
+  const w = 320, h = Math.max(8, Math.round(w * (S.base.img.naturalHeight / S.base.img.naturalWidth)));
+  if (!S.lightPaint || S.lightPaint.width !== w) {
+    const c = cvOf(w, h), x = c.getContext("2d");
+    x.fillStyle = "#808080"; x.fillRect(0, 0, w, h);
+    S.lightPaint = c;
+  }
+  return S.lightPaint;
+}
+function pointToLightPaint(clientX, clientY) {
+  const r = dom.layerOverlay.getBoundingClientRect();
+  const m = ensureLightPaint();
+  return { x: ((clientX - r.left) / r.width) * m.width, y: ((clientY - r.top) / r.height) * m.height };
+}
+function ensureOpenPaint() {
+  const S = state.scene;
+  if (!S.base.img) return null;
+  const w = 320, h = Math.max(8, Math.round(w * (S.base.img.naturalHeight / S.base.img.naturalWidth)));
+  if (!S.openPaint || S.openPaint.width !== w) {
+    const c = cvOf(w, h), x = c.getContext("2d");
+    x.fillStyle = "#808080"; x.fillRect(0, 0, w, h);
+    S.openPaint = c;
+  }
+  return S.openPaint;
+}
+function pointToOpenPaint(clientX, clientY) {
+  const r = dom.layerOverlay.getBoundingClientRect();
+  const m = ensureOpenPaint();
   return { x: ((clientX - r.left) / r.width) * m.width, y: ((clientY - r.top) / r.height) * m.height };
 }
 
@@ -3253,6 +3344,14 @@ function maskTarget() {
     if (!S.base.img) return null;
     return { kind: "window", src: S.base.img };
   }
+  if (state.brush.target === "light") {
+    if (!S.base.img) return null;
+    return { kind: "light", canvas: ensureLightPaint(), src: S.base.img };
+  }
+  if (state.brush.target === "open") {
+    if (!S.base.img) return null;
+    return { kind: "open", canvas: ensureOpenPaint(), src: S.base.img };
+  }
   const L = S.layers.find((x) => x.id === S.selectedId) || (S.layers.length === 1 ? S.layers[0] : null);
   if (!L) return null;
   return { kind: "subject", layer: L, canvas: L.mask, src: L.src };
@@ -3261,6 +3360,8 @@ function targetPoint(t, cx, cy) {
   if (t.kind === "sky") return pointToSky(cx, cy);
   if (t.kind === "blocker") return pointToOccluder(cx, cy);
   if (t.kind === "depth") return pointToDepth(cx, cy);
+  if (t.kind === "light") return pointToLightPaint(cx, cy);
+  if (t.kind === "open") return pointToOpenPaint(cx, cy);
   if (t.kind === "window") {
     const r = dom.layerOverlay.getBoundingClientRect();
     return { x: (cx - r.left) / r.width, y: (cy - r.top) / r.height, frac: true };
@@ -3372,7 +3473,7 @@ function startPaint(e) {
   if (!isWand(painting.tool)) {
     if (t.kind === "window") { /* windows are placed on release, not dragged */ }
     else if (t.kind === "sky") paintSky(p, p);
-    else if (t.kind === "blocker" || t.kind === "depth") paintFlat(t, p, p);
+    else if (t.kind === "blocker" || t.kind === "depth" || t.kind === "light" || t.kind === "open") paintFlat(t, p, p);
     else paintAt(t.layer, p, p);
     scheduleRender();
   }
@@ -3388,7 +3489,7 @@ function movePaint(e) {
   const p = targetPoint(painting.t, e.clientX, e.clientY);
   if (painting.t.kind === "window") { painting.last = p; return; }
   if (painting.t.kind === "sky") paintSky(painting.last, p);
-  else if (painting.t.kind === "blocker" || painting.t.kind === "depth") paintFlat(painting.t, painting.last, p);
+  else if (painting.t.kind === "blocker" || painting.t.kind === "depth" || painting.t.kind === "light" || painting.t.kind === "open") paintFlat(painting.t, painting.last, p);
   else paintAt(painting.t.layer, painting.last, p);
   painting.last = p;
   scheduleRender();
@@ -3768,7 +3869,18 @@ function buildLayerStack() {
         buildLayerStack(); rerender();
         status("Night solved from the scene — light the windows to give it sources.", "ok");
       }, "Relight the scene as night, from its own geometry"],
+      ["🔦 Paint light", () => {
+        state.brush.target = "light"; state.brush.tool = "add"; state.brush.showMask = false;
+        S.nightSolve.visible = true; setBrush(true);
+        status("Brush to add light · − to take it away. Up to ±2.6 stops.", "ok");
+      }, "Push light onto a surface by hand"],
+      ["🕳 Paint sky reach", () => {
+        state.brush.target = "open"; state.brush.tool = "sub"; state.brush.showMask = false;
+        S.nightSolve.visible = true; setBrush(true);
+        status("Brush − over recesses and soffits that see no sky · + for open faces.", "ok");
+      }, "Correct how much sky a surface sees"],
       ["✕ Off", () => { S.nightSolve.visible = false; buildLayerStack(); rerender(); }],
+      ["↺ Clear paint", () => { S.lightPaint = null; S.openPaint = null; rerender(); toast("Painted light cleared"); }],
     ]),
     body: (b) => {
       const p = document.createElement("p");
