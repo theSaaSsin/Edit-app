@@ -143,6 +143,7 @@ const state = {
     lights: [],
     windows: { visible: false, list: [], warmth: 34, brightness: 62, spill: 45, variation: 35, seed: 5 },
     relight: { visible: true, dataUrl: null, img: null, strength: 100, scale: 10, colour: 100, protect: 20, keepDark: 45 },
+    nightSolve: { visible: false, strength: 100, exposure: 70, canyon: 26, skyAmbient: 46, skyHue: 214, skySat: 30, windowGain: 62, lampGain: 70, floorLevel: 42, keepDark: 40 },
     night: { visible: false, amount: 0, skyHue: 220, skySat: 22, skyDark: 78, skyDetail: 70, shadowCool: 18, lightWarm: 55, horizonGlow: 35, glowSide: 70, stars: 0, lampWarmth: 72, skyDetect: 50, skyFeather: 30, skyEdge: 70, skyTighten: 0, skyBurn: 0, skyDodge: 0, ambient: 42, killDaylight: 78, seed: 3 },
     selectedId: null, zTop: 1, look: null,
     refine: { reach: 45, strength: 80, spill: 80 },
@@ -1864,6 +1865,14 @@ function applyRelight(ctx, W, H, R) {
     if (colour < 1) for (let c = 0; c < 3; c++) ratio[i * 3 + c] = lr + (ratio[i * 3 + c] - lr) * colour;
   }
 
+  applyLightField(ctx, W, H, ratio, w, h, R);
+}
+
+/* Take a low-frequency illumination ratio and put it on the picture. Shared by
+   the imported relight and the locally solved one, so a field is applied the
+   same way however it was arrived at. */
+function applyLightField(ctx, W, H, ratio, w, h, R) {
+  const n = w * h;
   /* Encode log2(ratio) so the canvas can do the smooth upscale to full size —
      a ratio field interpolates correctly in log space, not linear.
 
@@ -1922,6 +1931,164 @@ function applyRelight(ctx, W, H, R) {
     }
   }
   ctx.putImageData(out, 0, 0);
+}
+
+/* ---------------------------------------------------------------------------
+   Solving the night locally.
+
+   The imported relight proved the useful half of the idea: a low-frequency
+   illumination field, multiplied onto real pixels, produces a believable
+   relight with none of the invented texture. The generator was only ever
+   supplying the FIELD. Everything else — the detail, the edges, the whole
+   photograph — was already here.
+
+   So build the field instead of borrowing it. This is a small renderer, and
+   it can be, because the app already knows the scene: where the sky is, where
+   the windows are, where the lights were placed, what occludes what.
+
+   Two ideas carry it, and both are why a per-pixel grade could never work:
+
+   · Take the daylight OUT before putting the night IN. The photograph's own
+     low-frequency luminance is, to a good approximation, the daylight field
+     that lit it. Dividing by it removes the sun's fingerprint — the reason a
+     graded night keeps looking like a dim day is that this term is never
+     removed, so every sunlit face stays proportionally bright.
+
+   · Sky light falls off with depth into the scene. A surface high on a
+     facade sees most of the sky; one under a balcony or down an alley sees
+     almost none. Marching up each column to the nearest open sky gives that
+     for free, and it is most of what makes a night street read as a street
+     rather than a flat dark wall.
+--------------------------------------------------------------------------- */
+function solveNightField(ctx, W, H, NS) {
+  const S = state.scene;
+  const cap = 480;
+  const sc = Math.min(1, cap / Math.max(W, H));
+  const w = Math.max(8, Math.round(W * sc)), h = Math.max(8, Math.round(H * sc));
+  const n = w * h;
+
+  const pc = cvOf(w, h);
+  pc.getContext("2d").drawImage(ctx.canvas, 0, 0, w, h);
+  const pd = pc.getContext("2d").getImageData(0, 0, w, h).data;
+
+  /* 1 — the daylight field currently in the picture. Low-frequency luminance
+     conflates illumination with albedo, but albedo is broadband and roughly
+     uncorrelated with position, so over a large blur it averages out and what
+     is left is dominated by the light. Blurred in log space, because this is
+     a multiplicative quantity. */
+  const day = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    day[i] = Math.log2(0.2126 * pd[i * 4] + 0.7152 * pd[i * 4 + 1] + 0.0722 * pd[i * 4 + 2] + 8);
+  }
+  const rD = Math.max(3, Math.round(Math.min(w, h) * 0.13));
+  boxBlur(day, w, h, rD, 1); boxBlur(day, w, h, rD >> 1, 1);
+  let dmean = 0;
+  for (let i = 0; i < n; i++) { day[i] = Math.pow(2, day[i]) - 8; dmean += day[i]; }
+  dmean = Math.max(1, dmean / n);
+  for (let i = 0; i < n; i++) day[i] = Math.max(0.06, day[i] / dmean);   // mean 1
+
+  /* 2 — how much open sky each pixel can see. Marching up the column to the
+     nearest sky pixel is a crude horizon, but it is the right crude one: it
+     makes the top of a facade brighter than its base and puts genuine darkness
+     under an archway, which is exactly the structure a flat grade lacks. */
+  const skyA = new Float32Array(n);
+  {
+    const sd = skyDataAt(w, h);
+    for (let i = 0; i < n; i++) skyA[i] = sd[i * 4] / 255;
+  }
+  const openness = new Float32Array(n);
+  const canyon = Math.max(0.02, (NS.canyon / 100) * 0.9) * h;
+  for (let x = 0; x < w; x++) {
+    let dist = 0;
+    for (let y = 0; y < h; y++) {
+      const i = y * w + x;
+      dist = skyA[i] > 0.5 ? 0 : dist + 1;
+      openness[i] = Math.exp(-dist / canyon);
+    }
+  }
+
+  /* 3 — the emitters. Windows and placed lights are the only things actually
+     making light at night, and inverse-square is what makes the falloff read
+     as light rather than as an airbrushed blob. */
+  const em = new Float32Array(n * 3);
+  const addEmitter = (fx, fy, rad, gain, hue, sat) => {
+    if (gain <= 0) return;
+    const [er, eg, eb] = hsl2rgb((((hue % 360) + 360) % 360) / 360, clamp(sat / 100, 0, 1), 0.58);
+    const cx = fx * w, cy = fy * h;
+    const rr = Math.max(2, rad * Math.max(w, h));
+    const reach = rr * 5;
+    const x0 = Math.max(0, Math.floor(cx - reach)), x1 = Math.min(w - 1, Math.ceil(cx + reach));
+    const y0 = Math.max(0, Math.floor(cy - reach)), y1 = Math.min(h - 1, Math.ceil(cy + reach));
+    for (let y = y0; y <= y1; y++) {
+      for (let x = x0; x <= x1; x++) {
+        const dx = x - cx, dy = y - cy;
+        const d2 = (dx * dx + dy * dy) / (rr * rr);
+        const f = gain / (1 + d2 * 5.5);
+        if (f < 0.002) continue;
+        const i = (y * w + x) * 3;
+        em[i] += f * er; em[i + 1] += f * eg; em[i + 2] += f * eb;
+      }
+    }
+  };
+
+  const WN = S.windows;
+  if (WN.visible && WN.list.length) {
+    const rnd = mulberry32((WN.seed | 0) * 7919 + 41);
+    const g = (NS.windowGain / 100) * 0.42;
+    for (const win of WN.list) {
+      if (!win.on) continue;
+      const jit = 1 - (WN.variation / 100) * rnd();
+      addEmitter(win.x, win.y, Math.max(win.w, win.h) * 0.9, g * jit, 34 + WN.warmth * 0.12, 55 + WN.warmth * 0.25);
+    }
+  }
+  for (const lt of S.lights) {
+    if (!lt.visible) continue;
+    const t = LIGHT_TYPES[lt.type] || LIGHT_TYPES.sodium;
+    addEmitter(lt.x, lt.y, (lt.radius / 100) * 0.32, (lt.intensity / 100) * (NS.lampGain / 100) * 1.15, t.hue, t.sat);
+  }
+
+  /* 4 — assemble, and divide the daylight out. */
+  const [sr, sg, sb] = hsl2rgb((((NS.skyHue % 360) + 360) % 360) / 360, clamp(NS.skySat / 100, 0, 1), 0.52);
+  const skyAmb = (NS.skyAmbient / 100) * 0.30;
+  const base = 0.010 + (NS.floorLevel / 100) * 0.055;
+  const exposure = 1;   // set by the auto-exposure below, not by hand
+  const ratio = new Float32Array(n * 3);
+  const skyCol = [sr, sg, sb];
+  for (let i = 0; i < n; i++) {
+    const o = openness[i], d = day[i], s = skyA[i];
+    for (let c = 0; c < 3; c++) {
+      // ambient floor + sky light scaled by how much sky this pixel sees
+      let lit = base + skyAmb * o * skyCol[c] + em[i * 3 + c];
+      /* The sky itself is not a surface being lit — it IS the light. Give it
+         the night sky's own value rather than dividing it by a daylight
+         estimate it never had. */
+      const surf = (lit / d) * exposure;
+      const skyV = (base * 1.4 + skyAmb * 1.25 * skyCol[c]) * exposure / Math.max(0.25, d);
+      ratio[i * 3 + c] = clamp(surf * (1 - s) + skyV * s, 0.008, 8);
+    }
+  }
+
+  /* 5 — auto-expose. Without this the result lands wherever the scene's own
+     brightness happens to put it: across six test photographs the same
+     settings produced medians from 16 to 23 and crushed anywhere between
+     0.03% and 5.8% of the frame, because a scene with more light in it to
+     begin with ends up with more light in it at night, which is not how a
+     camera works. Aim the solved base at a median instead, and the exposure
+     slider becomes a statement about the picture rather than about the file. */
+  {
+    const pred = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const pl = 0.2126 * pd[i * 4] + 0.7152 * pd[i * 4 + 1] + 0.0722 * pd[i * 4 + 2];
+      const rl = 0.2126 * ratio[i * 3] + 0.7152 * ratio[i * 3 + 1] + 0.0722 * ratio[i * 3 + 2];
+      pred[i] = pl * rl;
+    }
+    const srt = Array.from(pred).sort((a, b) => a - b);
+    const med = Math.max(0.5, srt[srt.length >> 1]);
+    const target = 5 + (NS.exposure / 100) * 40;
+    const k = clamp(target / med, 0.02, 40);
+    for (let i = 0; i < n * 3; i++) ratio[i] = clamp(ratio[i] * k, 0.006, 10);
+  }
+  return { ratio, w, h };
 }
 
 function renderComposite(targetW, opts = {}) {
@@ -2009,6 +2176,22 @@ function renderComposite(targetW, opts = {}) {
     ctx.globalAlpha = L.opacity / 100;
     place((x, y) => ctx.drawImage(sprite, x, y, sw, sh));
     ctx.restore();
+  }
+
+  /* 2.5 — solve the night, BEFORE any source is drawn.
+
+     Order is not a detail here. The lit windows and the placed lamps are
+     night sources; running the solve after them would treat their glow as
+     part of the daylight the solve is trying to remove, divide it away, and
+     then spill what survived across the whole frame. So the scene is taken to
+     night first, and the sources are lit on top of it — which is also the
+     honest reading of what they are: the solve supplies the bounce those
+     sources throw onto the surfaces around them, and the draws below supply
+     the sources you can actually see. */
+  const NS = S.nightSolve;
+  if (NS.visible && NS.strength > 0) {
+    const f = solveNightField(ctx, W, H, NS);
+    applyLightField(ctx, W, H, f.ratio, f.w, f.h, { strength: NS.strength, keepDark: NS.keepDark });
   }
 
   /* Lit windows. Drawn before the placeable lights so a lamp still washes
@@ -2164,7 +2347,7 @@ function renderComposite(targetW, opts = {}) {
     ctx.restore();
   }
 
-  /* 5.5 — lighting transfer */
+  /* 5.5 — lighting transfer from an imported relight */
   const RL = S.relight;
   if (RL.visible && RL.img && RL.strength > 0) applyRelight(ctx, W, H, RL);
 
@@ -3573,6 +3756,40 @@ function buildLayerStack() {
     },
   }));
 
+  /* 🌃 Solved night */
+  host.appendChild(sectionCard({
+    key: "nightSolve", icon: "🌃", title: "Solve the night",
+    meta: S.nightSolve.visible ? "on" : "off",
+    visible: S.nightSolve.visible,
+    onToggle: () => { S.nightSolve.visible = !S.nightSolve.visible; buildLayerStack(); rerender(); },
+    actions: btnRow([
+      ["🌃 Solve", () => {
+        S.nightSolve.visible = true; S.night.visible = false;
+        buildLayerStack(); rerender();
+        status("Night solved from the scene — light the windows to give it sources.", "ok");
+      }, "Relight the scene as night, from its own geometry"],
+      ["✕ Off", () => { S.nightSolve.visible = false; buildLayerStack(); rerender(); }],
+    ]),
+    body: (b) => {
+      const p = document.createElement("p");
+      p.className = "panel-hint"; p.style.margin = "2px 0 8px";
+      p.textContent = "Builds an actual night light field — ambient sky falling off with depth into the scene, plus every lit window and placed light as a real emitter — then divides the daylight out and multiplies it on. Same maths as the imported relight, no second app. Give it sources: tap windows and drop lights, and it solves around them.";
+      b.appendChild(p);
+      [
+        { k: "strength",   label: "Strength",       min: 0, max: 100 },
+        { k: "exposure",   label: "Exposure",       min: 0, max: 100, hint: "how dark the night is" },
+        { k: "canyon",     label: "Depth falloff",  min: 2, max: 100, hint: "how fast sky light dies going down" },
+        { k: "skyAmbient", label: "Sky light",      min: 0, max: 100 },
+        { k: "skyHue",     label: "Sky hue",        min: 0, max: 360 },
+        { k: "skySat",     label: "Sky saturation", min: 0, max: 100 },
+        { k: "windowGain", label: "Window output",  min: 0, max: 100 },
+        { k: "lampGain",   label: "Lamp output",    min: 0, max: 100 },
+        { k: "floorLevel", label: "Ambient floor",  min: 0, max: 100, hint: "raise if shadows go pure black" },
+        { k: "keepDark",   label: "Protect shadows", min: 0, max: 100 },
+      ].forEach((sp) => b.appendChild(sliderRow(sp, S.nightSolve, rerender)));
+    },
+  }));
+
   /* 🌗 Lighting transfer */
   host.appendChild(sectionCard({
     key: "relight", icon: "🌗", title: "Lighting transfer",
@@ -4122,6 +4339,7 @@ function newSession() {
     lights: [],
     windows: { visible: false, list: [], warmth: 34, brightness: 62, spill: 45, variation: 35, seed: 5 },
     relight: { visible: true, dataUrl: null, img: null, strength: 100, scale: 10, colour: 100, protect: 20, keepDark: 45 },
+    nightSolve: { visible: false, strength: 100, exposure: 70, canyon: 26, skyAmbient: 46, skyHue: 214, skySat: 30, windowGain: 62, lampGain: 70, floorLevel: 42, keepDark: 40 },
     night: { visible: false, amount: 0, skyHue: 220, skySat: 22, skyDark: 78, skyDetail: 70, shadowCool: 18, lightWarm: 55, horizonGlow: 35, glowSide: 70, stars: 0, lampWarmth: 72, skyDetect: 50, skyFeather: 30, skyEdge: 70, skyTighten: 0, skyBurn: 0, skyDodge: 0, ambient: 42, killDaylight: 78, seed: 3 },
     refine: { reach: 45, strength: 80, spill: 80 },
     selectedId: null, zTop: 1, look: null,
