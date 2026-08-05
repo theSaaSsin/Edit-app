@@ -1026,13 +1026,102 @@ const newLight = (type = "sodium") => {
     x: 0.72, y: 0.3, radius: 42, intensity: 70,
     hue: t.hue, sat: t.sat, falloff: 55,
     beamAngle: 200, beamSpread: t.spread, airlight: 30,
+    shadows: 100, shadowSoft: 45,
   };
 };
+
+/* ============================================================
+   OCCLUSION — what stands between a surface and the lamp
+
+   Until now a light reached every pixel within its radius, so a lamp
+   behind a wall lit the far side of it and a subject standing under one
+   cast nothing onto the ground. That flatness is what stops placed light
+   reading as light rather than as a gradient.
+
+   A photograph carries no depth, so this does not try to infer any. It
+   ray-marches a 2D occluder buffer instead: subject cut-outs block by
+   default, since an object standing in the scene plainly does, and
+   anything else — a wall, a fence, a parked car — is painted with the
+   same brush used for every other mask.
+
+   The march runs at low resolution and is blurred afterwards. Shadows
+   from an area source are soft, so nothing is lost, and it keeps a cost
+   that would otherwise be prohibitive down to a few milliseconds.
+   ============================================================ */
+function occluderBuffer(w, h) {
+  const S = state.scene;
+  const c = cvOf(w, h);
+  const x = c.getContext("2d");
+  if (S.occluder) x.drawImage(S.occluder, 0, 0, w, h);   // hand-painted blockers
+
+  // Subjects occlude on their own account.
+  for (const L of S.layers) {
+    if (!L.visible || L.blocksLight === false) continue;
+    const sw = L.fw * w, sh = sw * (L.imgH / L.imgW);
+    x.save();
+    x.translate(L.fx * w, L.fy * h);
+    x.rotate((L.rot * Math.PI) / 180);
+    if (L.flipH) x.scale(-1, 1);
+    x.drawImage(L.mask, -sw / 2, -sh / 2, sw, sh);
+    x.restore();
+  }
+  const id = x.getImageData(0, 0, w, h);
+  const occ = new Float32Array(w * h);
+  for (let i = 0; i < occ.length; i++) occ[i] = id.data[i * 4] / 255;
+  return occ;
+}
+
+function shadowMapFor(occ, w, h, lxf, lyf, softness) {
+  const vis = new Float32Array(w * h);
+  const lx = lxf * w, ly = lyf * h;
+  const maxSteps = 54;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      const dx = lx - x, dy = ly - y;
+      const dist = Math.hypot(dx, dy);
+      if (dist < 1.5) { vis[i] = 1; continue; }
+      const n = Math.min(maxSteps, Math.max(4, Math.ceil(dist / 1.5)));
+      const stepLen = dist / (n + 1);
+      let block = 0;
+      /* A wall must not shadow itself. If this pixel is part of an occluder,
+         walk out of that occluder first and only start accumulating beyond
+         it — the face of a wall towards the lamp is lit, and only what lies
+         past the wall is in shade. Without this the blocker shades its own
+         surface and a painted building goes darker than the open ground. */
+      let inside = occ[i] > 0.02;
+      for (let s = 1; s <= n; s++) {
+        const t = s / (n + 1);
+        const sx = (x + dx * t) | 0, sy = (y + dy * t) | 0;
+        if (sx < 0 || sy < 0 || sx >= w || sy >= h) break;
+        const o = occ[sy * w + sx];
+        if (inside) { if (o <= 0.02) inside = false; continue; }
+        if (o > 0.02) {
+          /* Weight by the distance each step covers, not per step: otherwise a
+             thin wall blocks fully up close and barely at all far away, purely
+             because the ray is sampled the same number of times either way. */
+          block += o * (1 - t * 0.55) * stepLen * 0.24;
+          if (block >= 1) { block = 1; break; }
+        }
+      }
+      vis[i] = 1 - clamp(block, 0, 1);
+    }
+  }
+  boxBlur(vis, w, h, Math.max(1, Math.round((softness / 100) * Math.min(w, h) / 26)), 1);
+  return vis;
+}
 
 function applyLights(id, W, H, lights, unit, skyData) {
   const live = lights.filter((l) => l.visible && l.intensity > 0);
   if (!live.length) return id;
   const d = id.data;
+
+  /* One shadow map per light, at low resolution. Soft shadows do not need
+     detail, and a full-resolution march would cost seconds. */
+  const anyOcc = state.scene.occluder || state.scene.layers.some((L) => L.visible && L.blocksLight !== false);
+  const sw2 = anyOcc ? Math.max(64, Math.min(240, Math.round(W / 8))) : 0;
+  const sh2 = anyOcc ? Math.max(64, Math.round(sw2 * (H / W))) : 0;
+  const occ = anyOcc ? occluderBuffer(sw2, sh2) : null;
 
   // Precompute per-light constants so the inner loop stays cheap.
   const P = live.map((l) => {
@@ -1048,6 +1137,10 @@ function applyLights(id, W, H, lights, unit, skyData) {
       cone: l.beamSpread < 359,
       dir: ((l.beamAngle || 0) * Math.PI) / 180,
       half: ((l.beamSpread || 360) / 2) * (Math.PI / 180),
+      shadow: (occ && (l.shadows ?? 100) > 0)
+        ? shadowMapFor(occ, sw2, sh2, l.x, l.y, l.shadowSoft ?? 45)
+        : null,
+      shAmt: (l.shadows ?? 100) / 100,
     };
   });
 
@@ -1068,6 +1161,12 @@ function applyLights(id, W, H, lights, unit, skyData) {
           while (a < -Math.PI) a += Math.PI * 2;
           const t = clamp(1 - Math.abs(a) / p.half, 0, 1);
           f *= t * t * (3 - 2 * t);
+        }
+        if (f <= 0.002) continue;
+        if (p.shadow) {
+          const sx2 = ((x / W) * sw2) | 0, sy2 = ((y / H) * sh2) | 0;
+          const v = p.shadow[clamp(sy2, 0, sh2 - 1) * sw2 + clamp(sx2, 0, sw2 - 1)];
+          f *= 1 - (1 - v) * p.shAmt;
         }
         if (f <= 0.002) continue;
         const s = f * p.k;
@@ -1622,6 +1721,10 @@ function renderComposite(targetW, opts = {}) {
   if (state.brush.on && state.brush.showMask && S.base.img) {
     let md = null;
     if (state.brush.target === "sky") md = skyDataAt(W, H);
+    else if (state.brush.target === "blocker") {
+      const oc = cvOf(W, H); oc.getContext("2d").drawImage(ensureOccluder(), 0, 0, W, H);
+      md = oc.getContext("2d").getImageData(0, 0, W, H).data;
+    }
     else {
       const L = S.layers.find((x) => x.id === S.selectedId) || (S.layers.length === 1 ? S.layers[0] : null);
       if (L) {
@@ -2259,6 +2362,7 @@ const isDodgeBurn = (t) => t === "burn" || t === "dodge";
 const MASK_TARGETS = {
   subject: { icon: "🧍", name: "Subject" },
   sky:     { icon: "🌌", name: "Sky" },
+  blocker: { icon: "🧱", name: "Blockers" },
 };
 const isWand = (t) => t === "wandAdd" || t === "wandSub";
 
@@ -2276,6 +2380,24 @@ const isWand = (t) => t === "wandAdd" || t === "wandSub";
    it, so re-detecting or moving the detection sliders never throws away
    hand corrections.
    ============================================================ */
+function ensureOccluder() {
+  const S = state.scene;
+  if (!S.base.img) return null;
+  const w = 320, h = Math.max(8, Math.round(w * (S.base.img.naturalHeight / S.base.img.naturalWidth)));
+  if (!S.occluder || S.occluder.width !== w) {
+    const c = cvOf(w, h);
+    const x = c.getContext("2d");
+    x.fillStyle = "#000"; x.fillRect(0, 0, w, h);   // nothing blocks by default
+    S.occluder = c;
+  }
+  return S.occluder;
+}
+function pointToOccluder(clientX, clientY) {
+  const r = dom.layerOverlay.getBoundingClientRect();
+  const m = ensureOccluder();
+  return { x: ((clientX - r.left) / r.width) * m.width, y: ((clientY - r.top) / r.height) * m.height };
+}
+
 function ensureSkyEdit() {
   const S = state.scene;
   const m = skyMask();
@@ -2352,6 +2474,19 @@ function growRegion(srcImg, W, H, pt, tolPct, sizePct) {
     }
   }
   return { out, n };
+}
+
+function wandBlocker(pt, add) {
+  const c = ensureOccluder();
+  const W = c.width, H = c.height;
+  const { out, n } = growRegion(state.scene.base.img, W, H, pt, state.brush.strength, state.brush.size);
+  const ctx = c.getContext("2d");
+  const id = ctx.getImageData(0, 0, W, H);
+  const v = add ? 255 : 0;
+  for (let i = 0; i < out.length; i++) { if (!out[i]) continue; const j = i * 4; id.data[j] = id.data[j + 1] = id.data[j + 2] = v; }
+  ctx.putImageData(id, 0, 0);
+  scheduleRender();
+  toast(`🧱 ${add ? "Marked" : "Cleared"} ${Math.round((n / (W * H)) * 100)}% as a light blocker`);
 }
 
 function wandSubject(L, pt, add) {
@@ -2438,12 +2573,35 @@ function maskTarget() {
     if (!S.base.img) return null;
     return { kind: "sky", canvas: ensureSkyEdit(), src: S.base.img };
   }
+  if (state.brush.target === "blocker") {
+    if (!S.base.img) return null;
+    return { kind: "blocker", canvas: ensureOccluder(), src: S.base.img };
+  }
   const L = S.layers.find((x) => x.id === S.selectedId) || (S.layers.length === 1 ? S.layers[0] : null);
   if (!L) return null;
   return { kind: "subject", layer: L, canvas: L.mask, src: L.src };
 }
 function targetPoint(t, cx, cy) {
-  return t.kind === "sky" ? pointToSky(cx, cy) : pointToMask(t.layer, cx, cy);
+  if (t.kind === "sky") return pointToSky(cx, cy);
+  if (t.kind === "blocker") return pointToOccluder(cx, cy);
+  return pointToMask(t.layer, cx, cy);
+}
+/* Blockers paint like any other mask, straight into the occluder buffer. */
+function paintBlocker(from, to) {
+  const B = state.brush;
+  const c = ensureOccluder();
+  if (isDodgeBurn(B.tool)) { dodgeBurnStroke(c, from, to); scheduleRender(); return; }
+  const ctx = c.getContext("2d");
+  const radius = Math.max(1, (B.size / 100) * Math.min(c.width, c.height) * 0.35);
+  const alpha = (B.strength / 100) * 0.6;
+  const color = B.tool === "sub" ? "rgba(0,0,0,ALPHA)" : "rgba(255,255,255,ALPHA)";
+  const dist = Math.hypot(to.x - from.x, to.y - from.y);
+  const steps = Math.max(1, Math.ceil(dist / (radius * 0.3)));
+  for (let i = 1; i <= steps; i++) {
+    const t = i / steps;
+    stamp(ctx, from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t, radius, B.soft, alpha, color);
+  }
+  scheduleRender();
 }
 
 /* Local dodge/burn. Unlike the other tools this is read-modify-write: the
@@ -2529,7 +2687,9 @@ function startPaint(e) {
   const p = targetPoint(t, e.clientX, e.clientY);
   painting = { t, last: p, startX: e.clientX, startY: e.clientY, moved: false, tool: state.brush.tool };
   if (!isWand(painting.tool)) {
-    if (t.kind === "sky") paintSky(p, p); else paintAt(t.layer, p, p);
+    if (t.kind === "sky") paintSky(p, p);
+    else if (t.kind === "blocker") paintBlocker(p, p);
+    else paintAt(t.layer, p, p);
     scheduleRender();
   }
   dom.layerOverlay.setPointerCapture?.(e.pointerId);
@@ -2543,6 +2703,7 @@ function movePaint(e) {
   if (isWand(painting.tool)) return;          // a wand acts on release, not on drag
   const p = targetPoint(painting.t, e.clientX, e.clientY);
   if (painting.t.kind === "sky") paintSky(painting.last, p);
+  else if (painting.t.kind === "blocker") paintBlocker(painting.last, p);
   else paintAt(painting.t.layer, painting.last, p);
   painting.last = p;
   scheduleRender();
@@ -2555,6 +2716,7 @@ function endPaint(e) {
   if (p && isWand(p.tool) && !p.moved) {
     const add = p.tool === "wandAdd";
     if (p.t.kind === "sky") wandSky(p.last, add);
+    else if (p.t.kind === "blocker") wandBlocker(p.last, add);
     else wandSubject(p.t.layer, p.last, add);
     buildBrushBar();
   }
@@ -2892,6 +3054,8 @@ function buildLayerStack() {
           { k: "hue",       label: "Colour",     min: 0, max: 359, unit: "°" },
           { k: "sat",       label: "Saturation", min: 0, max: 100 },
           { k: "airlight",  label: "Haze",       min: 0, max: 100, hint: "glow in the air" },
+          { k: "shadows",   label: "Casts shadows", min: 0, max: 100, hint: "blocked by subjects & blockers" },
+          { k: "shadowSoft", label: "Shadow softness", min: 0, max: 100 },
         ];
         if (lt.beamSpread < 359) {
           rows.push({ k: "beamAngle",  label: "Beam aim",   min: 0, max: 359, unit: "°" });
@@ -3043,6 +3207,11 @@ function buildLayerStack() {
         sw.innerHTML = `<input type="checkbox" ${L.shadow.on ? "checked" : ""} /><span>Cast &amp; contact shadow</span>`;
         sw.querySelector("input").addEventListener("change", (e) => { L.shadow.on = e.target.checked; rerender(); });
         b.appendChild(sw);
+        const bw = document.createElement("label");
+        bw.className = "switch";
+        bw.innerHTML = `<input type="checkbox" ${L.blocksLight !== false ? "checked" : ""} /><span>Blocks light (casts into the scene)</span>`;
+        bw.querySelector("input").addEventListener("change", (e) => { L.blocksLight = e.target.checked; rerender(); });
+        b.appendChild(bw);
         const fw = document.createElement("label");
         fw.className = "switch";
         fw.innerHTML = `<input type="checkbox" ${L.shadowFollow !== false ? "checked" : ""} /><span>Aim shadow at the light</span>`;
@@ -3154,7 +3323,7 @@ function buildBrushBar() {
     b.textContent = `${t.icon} ${t.name}`;
     b.addEventListener("click", () => {
       B.target = k;
-      if (k === "sky" && B.tool === "fix") B.tool = "add";
+      if (k !== "subject" && B.tool === "fix") B.tool = "add";
       buildBrushBar(); scheduleRender();
     });
     tgt.appendChild(b);
@@ -3204,6 +3373,9 @@ function buildBrushBar() {
     b.className = "tool-btn tiny"; b.textContent = label; if (title) b.title = title;
     b.addEventListener("click", fn); acts.appendChild(b);
   };
+  if (B.target === "blocker") {
+    add("↺ Clear blockers", () => { state.scene.occluder = null; ensureOccluder(); scheduleRender(); toast("Blockers cleared."); });
+  }
   if (B.target === "sky") {
     add("↺ Reset sky edits", () => {
       state.scene.skyEdit = null; ensureSkyEdit(); skyEditDirty();
@@ -3230,7 +3402,9 @@ function buildBrushBar() {
 
   const hint = document.createElement("p");
   hint.className = "brush-hint";
-  const what = B.target === "sky" ? "the sky mask" : (L ? `“${L.name}”` : null);
+  const what = B.target === "sky" ? "the sky mask"
+             : B.target === "blocker" ? "what blocks light — walls, fences, cars"
+             : (L ? `“${L.name}”` : null);
   hint.textContent = what
     ? `${isWand(B.tool) ? "Tap" : "Drag"} on the image — ${BRUSH_TOOLS[B.tool].hint}. Editing ${what}.`
     : "Select a subject in the Layers panel to paint on it.";
