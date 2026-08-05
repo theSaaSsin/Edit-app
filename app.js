@@ -847,13 +847,30 @@ function detectSky(img, { threshold = 50, feather = 30 } = {}) {
     if (cls[i]) { skyL += lum[i]; skyG += grad[i]; skyY += y / H; sn++; }
     else { othL += lum[i]; othG += grad[i]; on++; }
   }
+  /* Deliberately biased towards precision over recall.
+
+     Benchmarked on twelve labelled photographs, the previous scoring got
+     every sky scene right and every NO-sky scene wrong — it never once
+     said "no sky". An indoor ceiling is smoother and brighter than the
+     cluttered room beneath it, exactly like sky over a street; a tabletop
+     backdrop and a bright sky are not separable on local statistics, which
+     the same measurement showed earlier for a sunset against rusted metal.
+
+     So this no longer tries to be clever. It demands strong evidence —
+     the region must be markedly brighter AND markedly smoother than the
+     rest of the picture — and otherwise reports nothing. That trades away
+     detections on hard-but-real skies, which cost one tap to add by hand,
+     to avoid confidently wrecking a photograph that has no sky in it,
+     which is silent and much worse. */
   let conf = 0;
   if (frac >= 0.004 && frac <= 0.985 && sn && on) {
-    const brighter = clamp(((skyL / sn) - (othL / on)) / 0.16 + 0.5, 0, 1);
-    const smoother = clamp(((othG / on) - (skyG / sn)) / 0.012 + 0.5, 0, 1);
-    const higher   = clamp((0.62 - (skyY / sn)) / 0.30, 0, 1);
-    conf = clamp(smoother * 0.45 + brighter * 0.33 + higher * 0.22, 0, 1);
-    conf = clamp((conf - 0.22) / 0.5, 0, 1);      // decisive, not mushy
+    const brightGap = (skyL / sn) - (othL / on);
+    const smoothRatio = ((othG / on) || 1e-6) / ((skyG / sn) || 1e-6);
+    const higher = clamp((0.62 - (skyY / sn)) / 0.30, 0, 1);
+    const bScore = clamp((brightGap - 0.16) / 0.22, 0, 1);
+    const sScore = clamp((smoothRatio - 1.35) / 1.1, 0, 1);
+    conf = Math.min(bScore, sScore) * (0.55 + 0.45 * higher);   // both, not either
+    if (frac > 0.80) conf *= clamp((0.985 - frac) / 0.18, 0, 1); // a runaway fill
   }
   m._skyConfidence = conf;
   m._skyFraction = frac;
@@ -3035,7 +3052,7 @@ function buildLayerStack() {
       if (!S.night.visible || S.night.amount <= 0) return "off";
       const c = S.base.img ? (skyMask()._skyConfidence ?? 1) : 1;
       const f = S.base.img ? (skyMask()._skyFraction ?? 0) : 0;
-      if (c < 0.15) return `${S.night.amount}% · no sky found`;
+      if (c < 0.15) return `${S.night.amount}% · no sky found — tap to add`;
       return `${S.night.amount}% · sky ${Math.round(f * 100)}%${c < 0.7 ? " (unsure)" : ""}`;
     })(),
     visible: S.night.visible,
@@ -3058,6 +3075,16 @@ function buildLayerStack() {
       p.className = "panel-hint"; p.style.margin = "2px 0 6px";
       p.textContent = "Darkening a daytime frame only makes it grey — a blown sky has no detail to recover. This finds the sky and replaces it, sinks the ground into night, and leaves warm artificial light burning.";
       b.appendChild(p);
+      const conf = S.base.img ? (skyMask()._skyConfidence ?? 1) : 1;
+      if (conf < 0.5) {
+        const warn = document.createElement("p");
+        warn.className = "panel-hint";
+        warn.style.cssText = "margin:2px 0 8px;color:var(--accent-strong)";
+        warn.textContent = conf < 0.15
+          ? "No sky found here. Detection only claims a sky when it is clearly brighter and smoother than the rest of the picture — it would rather miss one than wreck a photo that has none. If there IS sky, hit Edit sky mask and tap it."
+          : "Unsure about the sky in this one. Check it with Edit sky mask before leaning on the sky controls.";
+        b.appendChild(warn);
+      }
       const nightChange = () => { S._an = null; if (autoMatchAll()) syncSliders(); buildBrushBar(); rerender(); };
       [
         { k: "amount",      label: "Night",        min: 0, max: 100 },
