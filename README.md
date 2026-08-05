@@ -83,6 +83,73 @@ Fix light is the answer to a rim light that belongs to the photo the subject cam
 
 Refine reads the *current* mask, so a rough hand-brushed fix is a valid input: block the edge in loosely, then let Refine solve the strands.
 
+## Real night
+
+🌙 **Night** converts a daytime photograph to night rather than dropping a blue grade over it — the sky has to actually become sky at night.
+
+The sky is **re-exposed, not painted**: cloud structure is preserved and remapped, so what was a bright overcast becomes a dark overcast with its own shapes still in it, instead of a flat gradient. Daylight is then taken out of the scene by compressing the highlights that only a sun produces, and an ambient fill puts back what a night sky actually contributes.
+
+One correction worth recording, because the intuition is wrong: **night shadows are neutral, not blue.** Measured against a reference night photograph, its shadows sat at +0.014 on the blue-yellow axis while the version here was at −0.091. The depth in a night image comes from *warm* highlights — sodium, windows, headlights — against neutral shadow, not from tinting the shadows cool.
+
+Stars, horizon glow (with a side), sky hue, sky darkness, detail retention and lamp warmth are all on sliders.
+
+### Finding the sky
+
+Sky detection is a flood fill from the top of the frame, bounded by a gradient stop so it doesn't cross a roofline, then resolved with a guided filter — the same edge-aware solve the hair matte uses. Three things make it survive photographs it wasn't tuned on:
+
+- **Two fills, not one.** A single tolerance is either strict (stops short of rooflines, leaves sky misclassified) or loose (leaks into buildings). Running both gives the bounds from the image: what the strict fill reaches is certainly sky, what the loose fill can't reach is certainly not, and the guided filter resolves the band between against the photograph.
+- **A morphological close** bridges aerials, wires and bare branches, which are strong gradients that otherwise slice the sky into strips — visible as hard bands once it's re-lit.
+- **A blown-highlight continuation.** Sky that clips to white has lost its colour, so a fill measuring distance from a coloured seed stops dead at the clip point. Each fill continues through connected near-white, texture-free pixels, with the threshold set from the found sky's own median luminance so it tracks exposure rather than assuming it.
+
+It is **deliberately biased towards precision**. Benchmarked on twelve labelled photographs, an earlier version got every sky scene right and every *no*-sky scene wrong — it never once said "no sky". An indoor ceiling is smoother and brighter than the cluttered room beneath it, exactly like sky over a street. So it now demands strong evidence and otherwise reports nothing, and confidence scales the treatment down rather than switching it off. Currently **9/12 with zero false positives**: it misses three hard-but-real skies, which cost one tap to add by hand, rather than confidently wrecking a photograph that has no sky in it, which is silent and much worse.
+
+## Advanced masking
+
+Every mask in the app — the subject cut-out, the sky, light blockers, the depth map, windows — is editable by hand with the same tools, because no detector is right on every photograph and the fix should never be "try a different photo".
+
+| | |
+| --- | --- |
+| **＋ / −** | paint the mask in or out, with size, softness and strength |
+| **Wand ＋ / −** | tap to grow a region through anything close to it in colour |
+| **Burn / Dodge** | the Photoshop hair-channel technique, below |
+| **Tighten / Feather** | pull the matte in hard, then soften the result |
+
+**Dodge & burn on a mask** is the trick that gets hair out of a background: burn at a low exposure restricted to shadows drives the nearly-dark band of a strand to solid, dodge at a high exposure restricted to highlights drives the nearly-light background to clear, and between them the soft middle of the matte separates into an actual edge. It's exposed as two sliders per subject and works on any mask, not just hair.
+
+Hand edits sit **on top of** the detection rather than inside it, so re-detecting or moving the detection sliders never discards them.
+
+## Placeable lights
+
+💡 **Light** drops a light source into the scene and the scene re-solves around it — colour and type (sodium, headlight, interior, window, lamp), radius, intensity, falloff, and shadows.
+
+Lights are **multiplicative on the albedo**, so they light the picture that's there instead of pasting a glow over it, with a highlight roll-off above 0.72 to stop bright areas welding to flat white. They're attenuated by the sky mask, so a street lamp doesn't illuminate the clouds.
+
+### Occlusion — shadows that respect depth
+
+A shadow map is ray-marched in 2D from each light against an occluder buffer built from the subjects and any hand-painted blockers. Two corrections that a naive march gets wrong, both caught by measurement:
+
+- **The march has to walk out of its own occluder first.** Starting inside one, every wall shadowed itself.
+- **Blockage accrues per unit distance, not per step.** Weighted per step, thin walls blocked what was near them and not what was far.
+
+There's also a **depth map** you can paint: mark what's nearer and what's further, and a shadow stops at the surface it should land on instead of smearing across every wall in the frame at every depth.
+
+## Lit windows
+
+🪟 **Lit windows** turns a dark facade into an inhabited one. Tapping is the primary path, not a fallback: **Tap windows**, then one tap per window.
+
+That is a deliberate choice. On a daytime photo windows are *darker* than the wall — you're looking into an unlit room — and once the detector searched for dark regions instead of bright ones it found mortar patches, litter and, on one test photo, a football. **✨ Suggest** is still there and still useful as a starting point, but it proposes; you decide.
+
+What keeps a tap honest is **shape, not brightness**. A window is a solid rectangle — a claim about geometry rather than about what the thing is, which is why it holds where the brightness heuristics didn't. Measured over 16 taps on a tower block:
+
+| | fill of bounding box |
+| --- | --- |
+| the 11 real windows | 0.63 – 0.89 |
+| the 5 grabs that escaped along the facade | 0.30 – 0.43 |
+
+No overlap. So a grab that fails the test is **retried at a tighter tolerance** rather than rejected — an escape is nearly always the fill leaking through one soft edge — and if every tolerance leaks, a window the median size of the ones already placed is dropped at the tap point. A tap always lands something you can see and tap again to remove. A size floor sits under the fill test, because a sliver of window frame is solid enough to pass on fill alone.
+
+Brightness, warmth, spill and variation are global; the seeded variation stops a row of windows reading as identical. Tap a lit window again to switch it off.
+
 ## Glow specks
 
 🪰 **Glow specks** draws additive points of light — fireflies, embers, dust catching a lamp. Count, size, brightness, spread, height and colour, with a seeded shuffle so a swarm is reproducible. They're drawn rather than pasted, so they glow *into* the scene instead of sitting on top of it. The **🌙 Night** and **🪰 Fireflies** auto edits turn the scene to dusk and switch the swarm on.
@@ -104,9 +171,11 @@ Each look **grades the scene first, then matches the subject to the graded scene
 
 ## Use it on your phone
 
-Hosted straight from GitHub, nothing to install:
+Hosted straight from GitHub, nothing to install. This link always serves the newest pushed version — bookmark it:
 
-**https://raw.githack.com/theSaaSsin/Edit-app/main/index.html**
+**https://raw.githack.com/theSaaSsin/Edit-app/claude/image-filter-creator-repo-j78mf3/index.html**
+
+(The development branch is where the work lands. Once it's merged, the same page is at `.../Edit-app/main/index.html`.)
 
 ## Preview = export
 
