@@ -22,7 +22,7 @@ const newAdj = () => ({
   exposure: 0, contrast: 0, highlights: 0, shadows: 0,
   saturation: 0, temperature: 0, tint: 0, blur: 0, grain: 0,
 });
-const newMatte = () => ({ choke: 0, feather: 0, edgeDark: 0 });
+const newMatte = () => ({ choke: 0, feather: 0, edgeDark: 0, burn: 0, dodge: 0 });
 const newShadow = () => ({ on: true, angle: 135, length: 26, soft: 40, opacity: 45, contact: 55 });
 
 /* Slider specs — the panel UI is generated from these */
@@ -36,6 +36,8 @@ const ADJ_ROWS = [
   { k: "tint",        label: "Tint",        min: -100, max: 100, hint: "green ↔ magenta" },
 ];
 const MATTE_ROWS = [
+  { k: "burn",     label: "Burn shadows",    min: 0, max: 100, hint: "near-transparent → transparent" },
+  { k: "dodge",    label: "Dodge highlights", min: 0, max: 100, hint: "near-opaque → opaque" },
   { k: "choke",    label: "Shrink edge", min: 0, max: 100, hint: "eats a halo" },
   { k: "feather",  label: "Soften edge", min: 0, max: 100 },
   { k: "edgeDark", label: "Darken edge", min: 0, max: 100, hint: "kills bright fringing" },
@@ -139,7 +141,7 @@ const state = {
     finish: { visible: true, vignette: 0, grain: 0, fade: 0, blacks: 0, shoulder: 0, contrast: 0 },
     glow: { visible: false, count: 0, size: 30, spread: 60, cy: 62, intensity: 65, hue: 68, seed: 7 },
     lights: [],
-    night: { visible: false, amount: 0, skyHue: 220, skySat: 22, skyDark: 78, skyDetail: 70, shadowCool: 18, lightWarm: 55, horizonGlow: 35, glowSide: 70, stars: 0, lampWarmth: 72, skyDetect: 50, skyFeather: 30, skyEdge: 70, skyTighten: 0, ambient: 42, killDaylight: 78, seed: 3 },
+    night: { visible: false, amount: 0, skyHue: 220, skySat: 22, skyDark: 78, skyDetail: 70, shadowCool: 18, lightWarm: 55, horizonGlow: 35, glowSide: 70, stars: 0, lampWarmth: 72, skyDetect: 50, skyFeather: 30, skyEdge: 70, skyTighten: 0, skyBurn: 0, skyDodge: 0, ambient: 42, killDaylight: 78, seed: 3 },
     selectedId: null, zTop: 1, look: null,
     refine: { reach: 45, strength: 80, spill: 80 },
   },
@@ -445,6 +447,58 @@ function applyAdjust(id, a) {
     d[i + 2] = b <= 0 ? 0 : b >= 1 ? 255 : b * 255;
   }
   return id;
+}
+
+/* ============================================================
+   DODGE & BURN ON A MATTE
+
+   The darkroom technique photographers use on a hair channel, which works
+   because it is range-limited: burning only touches what is already dark,
+   dodging only what is already light.
+
+   On a matte that is exactly the right tool. Background removal leaves the
+   background at 0.05 instead of 0 and solid hair at 0.9 instead of 1 — both
+   read as haze. Burning the shadows drives the near-transparent to properly
+   transparent and dodging the highlights drives the near-opaque to properly
+   opaque, while the genuine mid-range, which is where individual strands
+   live, is left alone. A plain contrast curve cannot do this: it pivots
+   about the middle and eats exactly the strands worth keeping.
+
+   burn  — shadows only, small exposure, applied repeatedly
+   dodge — highlights only, larger exposure
+   ============================================================ */
+function dodgeBurnValue(v, burn, dodge) {
+  if (burn > 0) {
+    const w = Math.pow(clamp(1 - v / 0.55, 0, 1), 1.6);   // shadows range
+    v *= 1 - burn * w;
+  }
+  if (dodge > 0) {
+    const w = Math.pow(clamp((v - 0.45) / 0.55, 0, 1), 1.6); // highlights range
+    v += (1 - v) * dodge * w;
+  }
+  return clamp(v, 0, 1);
+}
+/* Applied globally the same idea is a range-limited levels move, and that is
+   the better formulation: a multiplicative push only ever approaches zero,
+   where a black point actually reaches it. Burn sets the black point, dodge
+   the white point, and everything between is rescaled — so haze is removed
+   outright while the strand ramp is stretched rather than clipped. The
+   multiplicative form above stays for the brush, where repeated local
+   application is the whole point. */
+function dodgeBurnLevels(burnPct, dodgePct) {
+  const bp = ((burnPct || 0) / 100) * 0.46;
+  const wp = 1 - ((dodgePct || 0) / 100) * 0.46;
+  return { bp, span: Math.max(0.04, wp - bp) };
+}
+function dodgeBurnMask8(data, burnPct, dodgePct) {
+  if (!burnPct && !dodgePct) return;
+  const { bp, span } = dodgeBurnLevels(burnPct, dodgePct);
+  const lut = new Uint8Array(256);
+  for (let i = 0; i < 256; i++) lut[i] = Math.round(clamp((i / 255 - bp) / span, 0, 1) * 255);
+  for (let i = 0; i < data.length; i += 4) {
+    const v = lut[data[i]];
+    data[i] = data[i + 1] = data[i + 2] = v;
+  }
 }
 
 /* Matte refinement — shrink / soften / darken the cut edge.
@@ -1146,7 +1200,7 @@ function skyMask() {
 }
 function skyDataAt(W, H) {
   const S = state.scene;
-  const sig = `${S.base.token}|${S.night.skyDetect}|${S.night.skyFeather}|${S.night.skyEdge}|${S.night.skyTighten}|${S.skyEditRev || 0}|${W}x${H}`;
+  const sig = `${S.base.token}|${S.night.skyDetect}|${S.night.skyFeather}|${S.night.skyEdge}|${S.night.skyTighten}|${S.night.skyBurn}|${S.night.skyDodge}|${S.skyEditRev || 0}|${W}x${H}`;
   if (S._skyData && S._skyData.sig === sig) return S._skyData.data;
 
   // Refine at a working resolution: the guide only has to resolve the
@@ -1239,6 +1293,11 @@ function skyDataAt(W, H) {
   } else if (tighten < 0) {
     const g0 = -tighten * 0.5;
     for (let i = 0; i < n; i++) q[i] = clamp(q[i] * (1 + g0) , 0, 1);
+  }
+
+  if (S.night.skyBurn || S.night.skyDodge) {
+    const { bp, span } = dodgeBurnLevels(S.night.skyBurn, S.night.skyDodge);
+    for (let i = 0; i < n; i++) q[i] = clamp((q[i] - bp) / span, 0, 1);
   }
 
   const out = cvOf(w, h);
@@ -1344,7 +1403,9 @@ function spriteFor(L, w) {
   // The mask is the alpha — kept separate from the photo so it stays editable.
   const mc = cvOf(W, H);
   mc.getContext("2d").drawImage(L.mask, 0, 0, W, H);
-  const md = mc.getContext("2d").getImageData(0, 0, W, H).data;
+  const mdRaw = mc.getContext("2d").getImageData(0, 0, W, H);
+  dodgeBurnMask8(mdRaw.data, L.matte.burn, L.matte.dodge);
+  const md = mdRaw.data;
   const id = bx.getImageData(0, 0, W, H);
   for (let i = 0; i < id.data.length; i += 4) id.data[i + 3] = md[i];
 
@@ -2168,8 +2229,11 @@ const BRUSH_TOOLS = {
   sub:     { icon: "➖", name: "Remove",  hint: "paint the mask out" },
   wandAdd: { icon: "✨", name: "Tap +",   hint: "tap a spot — grows through everything that colour" },
   wandSub: { icon: "🪄", name: "Tap −",   hint: "tap a spot — removes everything that colour" },
+  burn:    { icon: "🔥", name: "Burn",    hint: "darken only what's already dark — cleans haze" },
+  dodge:   { icon: "🔆", name: "Dodge",   hint: "brighten only what's already bright — solidifies" },
   fix:     { icon: "💡", name: "Fix light", hint: "subject only — kill a glow" },
 };
+const isDodgeBurn = (t) => t === "burn" || t === "dodge";
 const MASK_TARGETS = {
   subject: { icon: "🧍", name: "Subject" },
   sky:     { icon: "🌌", name: "Sky" },
@@ -2222,6 +2286,7 @@ function pointToSky(clientX, clientY) {
 function paintSky(from, to) {
   const B = state.brush;
   const c = ensureSkyEdit();
+  if (isDodgeBurn(B.tool)) { dodgeBurnStroke(c, from, to); skyEditDirty(); return; }
   const ctx = c.getContext("2d");
   const radius = Math.max(1, (B.size / 100) * Math.min(c.width, c.height) * 0.35);
   const alpha = (B.strength / 100) * 0.55;
@@ -2359,8 +2424,55 @@ function targetPoint(t, cx, cy) {
   return t.kind === "sky" ? pointToSky(cx, cy) : pointToMask(t.layer, cx, cy);
 }
 
+/* Local dodge/burn. Unlike the other tools this is read-modify-write: the
+   result depends on what the mask already says at each pixel, which is the
+   whole point of a range-limited tool. */
+function dodgeBurnStroke(canvas, from, to) {
+  const B = state.brush;
+  const ctx = canvas.getContext("2d");
+  const radius = Math.max(2, (B.size / 200) * canvas.width);
+  const expo = (B.strength / 100) * (B.tool === "burn" ? 0.06 : 0.55);  // burn wants a light touch
+  const dist = Math.hypot(to.x - from.x, to.y - from.y);
+  const steps = Math.max(1, Math.ceil(dist / (radius * 0.5)));
+  const pad = Math.ceil(radius) + 2;
+  const x0 = clamp(Math.floor(Math.min(from.x, to.x) - pad), 0, canvas.width - 1);
+  const y0 = clamp(Math.floor(Math.min(from.y, to.y) - pad), 0, canvas.height - 1);
+  const x1 = clamp(Math.ceil(Math.max(from.x, to.x) + pad), 1, canvas.width);
+  const y1 = clamp(Math.ceil(Math.max(from.y, to.y) + pad), 1, canvas.height);
+  const w = x1 - x0, h = y1 - y0;
+  if (w < 1 || h < 1) return;
+  const id = ctx.getImageData(x0, y0, w, h);
+  const d = id.data;
+  const inner = radius * clamp(1 - B.soft / 100, 0.02, 1);
+  for (let s2 = 0; s2 <= steps; s2++) {
+    const t = steps ? s2 / steps : 0;
+    const cx = from.x + (to.x - from.x) * t, cy = from.y + (to.y - from.y) * t;
+    for (let y = 0; y < h; y++) {
+      const dy = (y0 + y) - cy;
+      if (Math.abs(dy) > radius) continue;
+      for (let x = 0; x < w; x++) {
+        const dx = (x0 + x) - cx;
+        const r2 = Math.hypot(dx, dy);
+        if (r2 > radius) continue;
+        const fall = r2 <= inner ? 1 : 1 - (r2 - inner) / Math.max(1e-3, radius - inner);
+        const e = expo * fall * fall;
+        if (e <= 0.0005) continue;
+        const i = (y * w + x) * 4;
+        const v = dodgeBurnValue(d[i] / 255, B.tool === "burn" ? e : 0, B.tool === "dodge" ? e : 0);
+        d[i] = d[i + 1] = d[i + 2] = v * 255;
+      }
+    }
+  }
+  ctx.putImageData(id, x0, y0);
+}
+
 function paintAt(L, from, to) {
   const B = state.brush;
+  if (isDodgeBurn(B.tool)) {
+    dodgeBurnStroke(L.mask, from, to);
+    L.maskRev++; L._cache = null;
+    return;
+  }
   const target = B.tool === "fix" ? L.fix : L.mask;
   const ctx = target.getContext("2d");
   // Brush size is a share of the subject's own width, so it stays consistent
@@ -2714,6 +2826,8 @@ function buildLayerStack() {
         { k: "skyFeather", label: "Softness", min: 0, max: 100 },
         { k: "skyEdge",    label: "Edge snap", min: 0, max: 100, hint: "follow the roofline" },
         { k: "skyTighten", label: "Tighten", min: -100, max: 100, hint: "pull the matte in ↔ let it out" },
+        { k: "skyBurn",    label: "Burn shadows",     min: 0, max: 100, hint: "near-out → fully out" },
+        { k: "skyDodge",   label: "Dodge highlights", min: 0, max: 100, hint: "near-in → fully in" },
       ].forEach((sp) => b.appendChild(sliderRow(sp, S.night, () => { S._sky = null; S._skyData = null; nightChange(); })));
     },
   }));
@@ -3058,7 +3172,7 @@ function buildBrushBar() {
   rows.className = "brush-rows";
   rows.appendChild(mini(isWand(B.tool) ? "Reach" : "Size", "size", 1, 60));
   rows.appendChild(mini("Soft", "soft", 0, 100));
-  rows.appendChild(mini(isWand(B.tool) ? "Tolerance" : "Strength", "strength", 5, 100));
+  rows.appendChild(mini(isWand(B.tool) ? "Tolerance" : (isDodgeBurn(B.tool) ? "Exposure" : "Strength"), "strength", 5, 100));
   bar.appendChild(rows);
 
   const acts = document.createElement("div");
@@ -3175,7 +3289,7 @@ function newSession() {
     finish: { visible: true, vignette: 0, grain: 0, fade: 0, blacks: 0, shoulder: 0, contrast: 0 },
     glow: { visible: false, count: 0, size: 30, spread: 60, cy: 62, intensity: 65, hue: 68, seed: 7 },
     lights: [],
-    night: { visible: false, amount: 0, skyHue: 220, skySat: 22, skyDark: 78, skyDetail: 70, shadowCool: 18, lightWarm: 55, horizonGlow: 35, glowSide: 70, stars: 0, lampWarmth: 72, skyDetect: 50, skyFeather: 30, skyEdge: 70, skyTighten: 0, ambient: 42, killDaylight: 78, seed: 3 },
+    night: { visible: false, amount: 0, skyHue: 220, skySat: 22, skyDark: 78, skyDetail: 70, shadowCool: 18, lightWarm: 55, horizonGlow: 35, glowSide: 70, stars: 0, lampWarmth: 72, skyDetect: 50, skyFeather: 30, skyEdge: 70, skyTighten: 0, skyBurn: 0, skyDodge: 0, ambient: 42, killDaylight: 78, seed: 3 },
     refine: { reach: 45, strength: 80, spill: 80 },
     selectedId: null, zTop: 1, look: null,
   };
