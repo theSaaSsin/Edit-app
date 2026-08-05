@@ -141,6 +141,7 @@ const state = {
     finish: { visible: true, vignette: 0, grain: 0, fade: 0, blacks: 0, shoulder: 0, contrast: 0 },
     glow: { visible: false, count: 0, size: 30, spread: 60, cy: 62, intensity: 65, hue: 68, seed: 7 },
     lights: [],
+    windows: { visible: false, list: [], warmth: 34, brightness: 62, spill: 45, variation: 35, seed: 5 },
     night: { visible: false, amount: 0, skyHue: 220, skySat: 22, skyDark: 78, skyDetail: 70, shadowCool: 18, lightWarm: 55, horizonGlow: 35, glowSide: 70, stars: 0, lampWarmth: 72, skyDetect: 50, skyFeather: 30, skyEdge: 70, skyTighten: 0, skyBurn: 0, skyDodge: 0, ambient: 42, killDaylight: 78, seed: 3 },
     selectedId: null, zTop: 1, look: null,
     refine: { reach: 45, strength: 80, spill: 80 },
@@ -1088,6 +1089,115 @@ function occluderBuffer(w, h) {
   return occ;
 }
 
+/* ============================================================
+   WINDOW DETECTION
+
+   A night frame lives or dies on its lit windows — they are the thing the
+   eye reads as "someone is in there". Finding them is a much narrower
+   problem than finding sky, and one local statistics can actually do,
+   because a window is not merely bright: it is bright *relative to the
+   wall immediately around it*, compact, and roughly rectangular. A wall
+   is none of those, and the sky is excluded outright.
+
+   Detection returns regions rather than a mask, so each one can be lit,
+   tinted and switched off individually.
+   ============================================================ */
+function detectWindows(opts = {}) {
+  const S = state.scene;
+  if (!S.base.img) return [];
+  const maxDim = 700;
+  const w0 = S.base.img.naturalWidth, h0 = S.base.img.naturalHeight;
+  const s = Math.min(1, maxDim / Math.max(w0, h0));
+  const W = Math.max(8, Math.round(w0 * s)), H = Math.max(8, Math.round(h0 * s));
+
+  const c = cvOf(W, H);
+  c.getContext("2d").drawImage(S.base.img, 0, 0, W, H);
+  const D = c.getContext("2d").getImageData(0, 0, W, H).data;
+  const sky = skyDataAt(W, H);
+
+  const N = W * H;
+  const L = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    const j = i * 4;
+    L[i] = (0.2126 * D[j] + 0.7152 * D[j + 1] + 0.0722 * D[j + 2]) / 255;
+  }
+  // Local background = the wall around it, at a scale bigger than a window.
+  const bg = Float32Array.from(L);
+  boxBlur(bg, W, H, Math.max(4, Math.round(Math.min(W, H) / 16)), 1);
+
+  const lift = (opts.sensitivity ?? 50) / 100;
+  const thresh = 0.055 + (1 - lift) * 0.14;
+  /* Windows are not bright. In a daytime photograph you are looking into an
+     unlit interior, so a window is usually DARKER than the wall around it —
+     searching for bright regions found mortar patches and a football while
+     missing every curtained window on the terrace. What matters is that a
+     window DIFFERS from its wall and is rectangular, in either direction. */
+  const hit = new Uint8Array(N);
+  for (let i = 0; i < N; i++) {
+    if (sky[i * 4] > 110) continue;                 // never the sky
+    if (Math.abs(L[i] - bg[i]) > thresh) hit[i] = 1;
+  }
+
+  // Connected components, then keep only what looks like a window.
+  const lab = new Int32Array(N).fill(-1);
+  const out = [];
+  const minA = Math.max(18, N * (opts.minArea ?? 0.00022)), maxA = N * 0.03;
+  const stack = [];
+  for (let seed = 0; seed < N; seed++) {
+    if (!hit[seed] || lab[seed] !== -1) continue;
+    stack.length = 0; stack.push(seed);
+    lab[seed] = out.length;
+    let n = 0, minX = W, maxX = 0, minY = H, maxY = 0, sum = 0;
+    const px = [];
+    while (stack.length) {
+      const i = stack.pop();
+      const x = i % W, y = (i / W) | 0;
+      n++; sum += L[i]; px.push(i);
+      if (x < minX) minX = x; if (x > maxX) maxX = x;
+      if (y < minY) minY = y; if (y > maxY) maxY = y;
+      if (x > 0 && hit[i - 1] && lab[i - 1] === -1) { lab[i - 1] = out.length; stack.push(i - 1); }
+      if (x < W - 1 && hit[i + 1] && lab[i + 1] === -1) { lab[i + 1] = out.length; stack.push(i + 1); }
+      if (y > 0 && hit[i - W] && lab[i - W] === -1) { lab[i - W] = out.length; stack.push(i - W); }
+      if (y < H - 1 && hit[i + W] && lab[i + W] === -1) { lab[i + W] = out.length; stack.push(i + W); }
+    }
+    const bw = maxX - minX + 1, bh = maxY - minY + 1;
+    const fill = n / (bw * bh);
+    const aspect = bw / bh;
+    if (n < minA || n > maxA) continue;
+    if (bw < 5 || bh < 5) continue;
+    if (fill < (opts.fill ?? 0.55)) continue;                       // a window fills its box
+    if (aspect < 0.22 || aspect > 4.5) continue;     // not a long thin smear
+
+    /* Rectangularity. Bright mortar, litter and a football all pass a
+       fill-ratio test — they are blobs that happen to fill their bounding
+       box. A window is a RECTANGLE, so its rows are all the same width and
+       its columns all the same height. Measuring how much those vary
+       separates the two, and it is what stopped this detector boxing half
+       the brickwork in the yard. */
+    const rows = new Int32Array(bh), cols = new Int32Array(bw);
+    for (const i of px) { rows[((i / W) | 0) - minY]++; cols[(i % W) - minX]++; }
+    const cv = (arr) => {
+      let m = 0; for (const v of arr) m += v; m /= arr.length;
+      if (m <= 0) return 9;
+      let s2 = 0; for (const v of arr) s2 += (v - m) * (v - m);
+      return Math.sqrt(s2 / arr.length) / m;
+    };
+    if (cv(rows) > (opts.rect ?? 0.42) || cv(cols) > (opts.rect ?? 0.42)) continue;
+
+    // And it must differ meaningfully from the wall it sits in, either way.
+    let bgSum = 0; for (const i of px) bgSum += bg[i];
+    const delta = sum / n - bgSum / n;
+    if (Math.abs(delta) < thresh * 1.15) continue;
+    out.push({
+      id: uid("win"),
+      x: (minX + bw / 2) / W, y: (minY + bh / 2) / H,
+      w: bw / W, h: bh / H,
+      bright: sum / n, on: true,
+    });
+  }
+  return out.sort((a, b) => b.w * b.h - a.w * a.h).slice(0, 80);
+}
+
 /* Depth. Without it the occluder march treats the whole photograph as one
    flat plane, so a shadow slides across the ground, up the far wall and over
    a mid wall as though they were coplanar — which is exactly what a yard
@@ -1703,6 +1813,40 @@ function renderComposite(targetW, opts = {}) {
     ctx.save();
     ctx.globalAlpha = L.opacity / 100;
     place((x, y) => ctx.drawImage(sprite, x, y, sw, sh));
+    ctx.restore();
+  }
+
+  /* Lit windows. Drawn before the placeable lights so a lamp still washes
+     over them, and additively, because a window at night is a source rather
+     than a bright surface. */
+  const WIN = S.windows;
+  if (WIN && WIN.visible && WIN.list.length) {
+    const rnd = mulberry32((WIN.seed | 0) * 7919 + 13);
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    for (const win of WIN.list) {
+      const jitter = 1 - (WIN.variation / 100) * rnd();   // not every room is equally lit
+      if (!win.on) continue;
+      const cx = win.x * W, cy = win.y * H;
+      const ww = Math.max(2, win.w * W), wh = Math.max(2, win.h * H);
+      const b2 = (WIN.brightness / 100) * jitter;
+      const hue = 20 + (WIN.warmth / 100) * 40;
+      // the pane itself
+      const g = ctx.createLinearGradient(cx, cy - wh / 2, cx, cy + wh / 2);
+      g.addColorStop(0, `hsla(${hue},85%,72%,${(0.95 * b2).toFixed(3)})`);
+      g.addColorStop(1, `hsla(${hue},90%,58%,${(0.72 * b2).toFixed(3)})`);
+      ctx.fillStyle = g;
+      ctx.fillRect(cx - ww / 2, cy - wh / 2, ww, wh);
+      // light thrown onto the wall around it
+      if (WIN.spill > 0) {
+        const r2 = Math.max(ww, wh) * (0.7 + (WIN.spill / 100) * 2.4);
+        const sg = ctx.createRadialGradient(cx, cy, Math.min(ww, wh) * 0.4, cx, cy, r2);
+        sg.addColorStop(0, `hsla(${hue},88%,62%,${(0.42 * b2 * (WIN.spill / 100)).toFixed(3)})`);
+        sg.addColorStop(1, `hsla(${hue},88%,55%,0)`);
+        ctx.fillStyle = sg;
+        ctx.beginPath(); ctx.arc(cx, cy, r2, 0, Math.PI * 2); ctx.fill();
+      }
+    }
     ctx.restore();
   }
 
@@ -2420,6 +2564,7 @@ const MASK_TARGETS = {
   sky:     { icon: "🌌", name: "Sky" },
   blocker: { icon: "🧱", name: "Blockers" },
   depth:   { icon: "🪜", name: "Depth" },
+  window:  { icon: "🪟", name: "Windows" },
 };
 const isWand = (t) => t === "wandAdd" || t === "wandSub";
 
@@ -2554,6 +2699,67 @@ function growRegion(srcImg, W, H, pt, tolPct, sizePct) {
   return { out, n };
 }
 
+/* Tap a window to light it. Auto-detection proposes candidates; this is how
+   they are actually chosen, because one tap per window is quick and certain
+   whereas a detector confident enough to decide for you does not exist. */
+function tapWindow(pt, add) {
+  const S = state.scene;
+  const W2 = 700, H2 = Math.max(8, Math.round(W2 * (S.base.img.naturalHeight / S.base.img.naturalWidth)));
+  const px = { x: pt.x * W2, y: pt.y * H2 };
+  if (!add) {
+    const before = S.windows.list.length;
+    S.windows.list = S.windows.list.filter((w) =>
+      Math.abs(w.x - pt.x) > w.w * 0.75 || Math.abs(w.y - pt.y) > w.h * 0.75);
+    scheduleRender(); refreshStack();
+    toast(before === S.windows.list.length ? "No lit window there." : "Window switched off.");
+    return;
+  }
+  /* A window is a solid rectangle. That is a claim about *shape*, not about
+     what the thing is, which is why it survives where brightness heuristics
+     don't: measured over 16 taps on a tower block, the 11 real windows filled
+     0.63–0.89 of their bounding box while the 5 grabs that escaped along the
+     facade filled 0.30–0.43. Nothing overlapped. So when a grab fails the
+     shape test, tighten the tolerance and try again rather than giving up —
+     the escape is almost always the fill leaking through one soft edge. */
+  const shapeOf = (out, n) => {
+    let minX = W2, maxX = 0, minY = H2, maxY = 0;
+    for (let i = 0; i < out.length; i++) {
+      if (!out[i]) continue;
+      const x = i % W2, y = (i / W2) | 0;
+      if (x < minX) minX = x; if (x > maxX) maxX = x;
+      if (y < minY) minY = y; if (y > maxY) maxY = y;
+    }
+    const wpx = maxX - minX + 1, hpx = maxY - minY + 1;
+    return { minX, maxX, minY, maxY, bw: wpx / W2, bh: hpx / H2, fill: n / (wpx * hpx), area: (wpx * hpx) / (W2 * H2) };
+  };
+  // Solid, and big enough to be a window rather than a mortar line or a sliver
+  // of window frame — a thin edge passes the fill test easily but is never one.
+  const ok = (s, n) => n >= 6 && s.fill >= 0.55 && s.area <= 0.12
+    && s.bw >= 0.014 && s.bh >= 0.007 && s.bw <= 0.5 && s.bh <= 0.5;
+
+  let best = null;
+  for (const scale of [1, 0.6, 0.35, 0.2]) {
+    const tol = Math.max(2, state.brush.strength * scale);
+    const g = growRegion(S.base.img, W2, H2, px, tol, state.brush.size);
+    const s = shapeOf(g.out, g.n);
+    if (ok(s, g.n)) { best = s; break; }
+  }
+  if (!best) {
+    // Every tolerance leaked. Rather than do nothing, drop a window the size of
+    // the ones already placed — a tap should always land something you can see
+    // and tap again to remove.
+    const prior = S.windows.list;
+    const mw = prior.length ? prior.reduce((a, w) => a + w.w, 0) / prior.length : 0.05;
+    const mh = prior.length ? prior.reduce((a, w) => a + w.h, 0) / prior.length : 0.032;
+    best = { minX: (pt.x - mw / 2) * W2, maxX: (pt.x + mw / 2) * W2, minY: (pt.y - mh / 2) * H2, maxY: (pt.y + mh / 2) * H2, bw: mw, bh: mh };
+  }
+  const { minX, maxX, minY, maxY, bw, bh } = best;
+  S.windows.list.push({ id: uid("win"), x: (minX + maxX) / 2 / W2, y: (minY + maxY) / 2 / H2, w: bw, h: bh, on: true });
+  S.windows.visible = true;
+  scheduleRender(); refreshStack();
+  toast(`🪟 Window lit (${S.windows.list.length} total)`);
+}
+
 function wandFlat(t, pt, add) {
   const c = t.canvas;
   const W = c.width, H = c.height;
@@ -2661,6 +2867,10 @@ function maskTarget() {
     if (!S.base.img) return null;
     return { kind: "depth", canvas: ensureDepth(), src: S.base.img };
   }
+  if (state.brush.target === "window") {
+    if (!S.base.img) return null;
+    return { kind: "window", src: S.base.img };
+  }
   const L = S.layers.find((x) => x.id === S.selectedId) || (S.layers.length === 1 ? S.layers[0] : null);
   if (!L) return null;
   return { kind: "subject", layer: L, canvas: L.mask, src: L.src };
@@ -2669,6 +2879,10 @@ function targetPoint(t, cx, cy) {
   if (t.kind === "sky") return pointToSky(cx, cy);
   if (t.kind === "blocker") return pointToOccluder(cx, cy);
   if (t.kind === "depth") return pointToDepth(cx, cy);
+  if (t.kind === "window") {
+    const r = dom.layerOverlay.getBoundingClientRect();
+    return { x: (cx - r.left) / r.width, y: (cy - r.top) / r.height, frac: true };
+  }
   return pointToMask(t.layer, cx, cy);
 }
 /* Blockers and depth paint like any other mask, straight into their buffer.
@@ -2774,7 +2988,8 @@ function startPaint(e) {
   const p = targetPoint(t, e.clientX, e.clientY);
   painting = { t, last: p, startX: e.clientX, startY: e.clientY, moved: false, tool: state.brush.tool };
   if (!isWand(painting.tool)) {
-    if (t.kind === "sky") paintSky(p, p);
+    if (t.kind === "window") { /* windows are placed on release, not dragged */ }
+    else if (t.kind === "sky") paintSky(p, p);
     else if (t.kind === "blocker" || t.kind === "depth") paintFlat(t, p, p);
     else paintAt(t.layer, p, p);
     scheduleRender();
@@ -2789,6 +3004,7 @@ function movePaint(e) {
   if (Math.hypot(e.clientX - painting.startX, e.clientY - painting.startY) > 4) painting.moved = true;
   if (isWand(painting.tool)) return;          // a wand acts on release, not on drag
   const p = targetPoint(painting.t, e.clientX, e.clientY);
+  if (painting.t.kind === "window") { painting.last = p; return; }
   if (painting.t.kind === "sky") paintSky(painting.last, p);
   else if (painting.t.kind === "blocker" || painting.t.kind === "depth") paintFlat(painting.t, painting.last, p);
   else paintAt(painting.t.layer, painting.last, p);
@@ -2802,7 +3018,8 @@ function endPaint(e) {
   window.removeEventListener("pointerup", endPaint);
   if (p && isWand(p.tool) && !p.moved) {
     const add = p.tool === "wandAdd";
-    if (p.t.kind === "sky") wandSky(p.last, add);
+    if (p.t.kind === "window") tapWindow(p.last, add);
+    else if (p.t.kind === "sky") wandSky(p.last, add);
     else if (p.t.kind === "blocker" || p.t.kind === "depth") wandFlat(p.t, p.last, add);
     else wandSubject(p.t.layer, p.last, add);
     buildBrushBar();
@@ -2816,6 +3033,15 @@ function setBrush(on, tool) {
   dom.sceneStage.classList.toggle("brush-mode", on);
   renderHandles();
   buildBrushBar();
+  if (!on && state.brush._stackDirty) { state.brush._stackDirty = false; buildLayerStack(); }
+}
+
+/* Rebuilding the panel mid-brush reflows the page, which moves the stage out
+   from under a finger that is part-way through tapping a row of windows. So
+   while the brush is live the rebuild is deferred to when it's put down. */
+function refreshStack() {
+  if (state.brush.on) { state.brush._stackDirty = true; return; }
+  buildLayerStack();
 }
 
 async function runRefineHair(L) {
@@ -3110,6 +3336,41 @@ function buildLayerStack() {
         { k: "skyBurn",    label: "Burn shadows",     min: 0, max: 100, hint: "near-out → fully out" },
         { k: "skyDodge",   label: "Dodge highlights", min: 0, max: 100, hint: "near-in → fully in" },
       ].forEach((sp) => b.appendChild(sliderRow(sp, S.night, () => { S._sky = null; S._skyData = null; nightChange(); })));
+    },
+  }));
+
+  /* 🪟 Lit windows */
+  host.appendChild(sectionCard({
+    key: "windows", icon: "🪟", title: "Lit windows",
+    meta: S.windows.list.length ? `${S.windows.list.filter((w) => w.on).length} lit` : "none",
+    visible: S.windows.visible,
+    onToggle: () => { S.windows.visible = !S.windows.visible; buildLayerStack(); rerender(); },
+    actions: btnRow([
+      ["🪟 Tap windows", () => {
+        state.brush.target = "window"; state.brush.tool = "wandAdd"; state.brush.showMask = false;
+        setBrush(true);
+        status("Tap a window to light it · Tap − to switch one off.", "ok");
+      }, "Tap each window you want lit"],
+      ["✨ Suggest", () => {
+        const found = detectWindows({ sensitivity: 50 });
+        S.windows.list = found.map((f) => ({ ...f, on: true }));
+        S.windows.visible = true;
+        buildLayerStack(); rerender();
+        toast(`Found ${found.length} candidate${found.length === 1 ? "" : "s"} — check them and tap to fix.`);
+      }, "Guess at the windows — expect to correct it"],
+      ["✕ None", () => { S.windows.list = []; buildLayerStack(); rerender(); }],
+    ]),
+    body: (b) => {
+      const p = document.createElement("p");
+      p.className = "panel-hint"; p.style.margin = "2px 0 8px";
+      p.textContent = "Lit windows are what make a night frame read as inhabited. Tapping each one is the reliable route — automatic suggestion finds some of them and also finds mortar patches and, on one test photo, a football.";
+      b.appendChild(p);
+      [
+        { k: "brightness", label: "Brightness", min: 0, max: 100 },
+        { k: "warmth",     label: "Warmth",     min: 0, max: 100 },
+        { k: "spill",      label: "Spill onto the wall", min: 0, max: 100 },
+        { k: "variation",  label: "Variation",  min: 0, max: 100, hint: "not every room matches" },
+      ].forEach((sp) => b.appendChild(sliderRow(sp, S.windows, rerender)));
     },
   }));
 
@@ -3587,6 +3848,7 @@ function newSession() {
     finish: { visible: true, vignette: 0, grain: 0, fade: 0, blacks: 0, shoulder: 0, contrast: 0 },
     glow: { visible: false, count: 0, size: 30, spread: 60, cy: 62, intensity: 65, hue: 68, seed: 7 },
     lights: [],
+    windows: { visible: false, list: [], warmth: 34, brightness: 62, spill: 45, variation: 35, seed: 5 },
     night: { visible: false, amount: 0, skyHue: 220, skySat: 22, skyDark: 78, skyDetail: 70, shadowCool: 18, lightWarm: 55, horizonGlow: 35, glowSide: 70, stars: 0, lampWarmth: 72, skyDetect: 50, skyFeather: 30, skyEdge: 70, skyTighten: 0, skyBurn: 0, skyDodge: 0, ambient: 42, killDaylight: 78, seed: 3 },
     refine: { reach: 45, strength: 80, spill: 80 },
     selectedId: null, zTop: 1, look: null,
