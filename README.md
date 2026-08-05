@@ -83,6 +83,36 @@ Fix light is the answer to a rim light that belongs to the photo the subject cam
 
 Refine reads the *current* mask, so a rough hand-brushed fix is a valid input: block the edge in loosely, then let Refine solve the strands.
 
+## Lighting transfer — the honest route to a real relight
+
+**Sliders cannot do a convincing day→night.** Everything in the grading pipeline is per-pixel: it can change what a pixel *is*, but it has no idea where light comes from, what it hits, or that a balcony reveal should be black. Real night is about light and geometry, so a grade flattens it into "darker and bluer" — which is exactly what a muddy result looks like, and no amount of slider-tuning fixes a structural problem.
+
+Generative relighting is superb at that judgement and terrible at leaving a photograph's own pixels alone. Those two facts sit at **different spatial frequencies** — illumination varies slowly across a frame, while invented brick, smeared window frames and mangled text are all high-frequency — so they can be separated.
+
+🌗 **Lighting transfer** does exactly that, in three steps in the card:
+
+1. **⬇ Plate** — exports a clean plate (no finish, no previous relight, so nothing compounds).
+2. **📋 Prompt** — relight it in the free Gemini app, or anything else.
+3. **⬆ Relit** — load the result back.
+
+Only the **low-frequency illumination field** is kept and multiplied onto your real photograph. The AI's lighting judgement arrives; its pixels do not.
+
+Measured against a reference carrying deliberately destroyed multi-scale patterning (4/16/48px blocks, far worse than any real output):
+
+| | |
+| --- | --- |
+| light field recovered | 83.7 → **6.3** error |
+| mean luminance | **45.2** against a target of 44 |
+| invented detail taken | about **2** of the 423.7 on offer |
+
+It works in **ratio, not difference** — multiplying is what a light source does to a surface, whereas a difference shifts everything by the same amount and the blacks go milky. Three things that had to be corrected, all found by measuring rather than looking:
+
+- Guarding the division with a floor added to *both* sides — the obvious thing to write — drags every ratio toward 1 whenever either side is small, lifting exactly the tones a night frame needs to keep. The guard belongs on the denominator alone.
+- Protecting shadows by rolling the effect off in dark tones is backwards here, because in a day→night transfer the effect *is* the darkening. It now suppresses the *direction*: darkening always applies in full, brightening is what gets held back.
+- Illumination is multiplicative, so its average is geometric. Blurring the **logarithm** rather than the values stops one bright lamp pool dragging up the shadow around it.
+
+**Coarseness** is the one knob that matters, defaulted to 10 off a measured sweep rather than taste: invented detail is flat from there upward while light accuracy halves by 40. Raise it only if any of the relight's invented detail starts showing through. **Take colour** at 0 keeps its brightness and discards its white balance.
+
 ## Real night
 
 🌙 **Night** converts a daytime photograph to night rather than dropping a blue grade over it — the sky has to actually become sky at night.
