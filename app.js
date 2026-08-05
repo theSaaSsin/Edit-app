@@ -142,6 +142,7 @@ const state = {
     glow: { visible: false, count: 0, size: 30, spread: 60, cy: 62, intensity: 65, hue: 68, seed: 7 },
     lights: [],
     windows: { visible: false, list: [], warmth: 34, brightness: 62, spill: 45, variation: 35, seed: 5 },
+    relight: { visible: true, dataUrl: null, img: null, strength: 100, scale: 10, colour: 100, protect: 20, keepDark: 45 },
     night: { visible: false, amount: 0, skyHue: 220, skySat: 22, skyDark: 78, skyDetail: 70, shadowCool: 18, lightWarm: 55, horizonGlow: 35, glowSide: 70, stars: 0, lampWarmth: 72, skyDetect: 50, skyFeather: 30, skyEdge: 70, skyTighten: 0, skyBurn: 0, skyDodge: 0, ambient: 42, killDaylight: 78, seed: 3 },
     selectedId: null, zTop: 1, look: null,
     refine: { reach: 45, strength: 80, spill: 80 },
@@ -1776,6 +1777,153 @@ function mulberry32(a) {
 const sortedLayers = () => [...state.scene.layers].sort((a, b) => a.z - b.z);
 
 /* ---- The one renderer: preview and export both call this ---- */
+/* ---------------------------------------------------------------------------
+   Lighting transfer.
+
+   Generative relighting is very good at deciding where light comes from and
+   what colour it is, and very bad at leaving a photograph's own pixels alone —
+   which is the whole complaint about it. Those two facts live at different
+   spatial frequencies, so they can be separated: illumination varies slowly
+   across a frame, while invented brick, smeared window frames and mangled
+   text are all high-frequency.
+
+   So take the relit version's ILLUMINATION and none of its detail. Blur both
+   the composite and the relit reference until nothing is left but the light
+   field, divide one by the other, and multiply that ratio back onto the real
+   photograph. Every pixel of texture in the result is still the photograph's;
+   only the light on it comes from elsewhere.
+
+   Working in ratio rather than difference is what makes it behave like light:
+   multiplying is what a light source does to a surface, so a dark surface
+   stays dark and a bright one carries the change, instead of everything being
+   shifted by the same amount and the blacks going milky.
+--------------------------------------------------------------------------- */
+function applyRelight(ctx, W, H, R) {
+  // A medium working resolution is plenty: the output is a blurred field, and
+  // solving it at export resolution is wasted work for an identical answer.
+  const cap = 480;
+  const sc = Math.min(1, cap / Math.max(W, H));
+  const w = Math.max(8, Math.round(W * sc)), h = Math.max(8, Math.round(H * sc));
+
+  const curC = cvOf(w, h), refC = cvOf(w, h);
+  curC.getContext("2d").drawImage(ctx.canvas, 0, 0, w, h);
+  /* The reference is stretched to the composite's frame rather than letter-
+     boxed. Relighting apps commonly hand back a slightly different aspect
+     ratio, and for a field this soft a small stretch is invisible, whereas a
+     letterbox would put a hard band of "no change" down the edges. */
+  refC.getContext("2d").drawImage(R.img, 0, 0, w, h);
+
+  const cd = curC.getContext("2d").getImageData(0, 0, w, h).data;
+  const rd = refC.getContext("2d").getImageData(0, 0, w, h).data;
+
+  const n = w * h;
+  const cur = new Float32Array(n * 3), ref = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    for (let c = 0; c < 3; c++) { cur[i * 3 + c] = cd[i * 4 + c]; ref[i * 3 + c] = rd[i * 4 + c]; }
+  }
+
+  /* Blur the LOGARITHM, not the value. Illumination is multiplicative, so the
+     right average for it is geometric; an arithmetic blur lets one bright lamp
+     pool drag up the whole neighbourhood it sits in, which shows up as a
+     systematic lift of the surrounding shadow. Averaging in log space is the
+     geometric mean, and it leaves the dark surround dark. */
+  const lfloor = 3 + (R.protect / 100) * 22;
+  for (let i = 0; i < n * 3; i++) {
+    cur[i] = Math.log2(cur[i] + lfloor);
+    ref[i] = Math.log2(ref[i] + lfloor);
+  }
+  const r = Math.max(2, Math.round((Math.min(w, h) * R.scale) / 100));
+  boxBlur(cur, w, h, r, 3);
+  boxBlur(ref, w, h, r, 3);
+  boxBlur(cur, w, h, Math.max(1, r >> 1), 3);   // second pass ≈ gaussian, so the
+  boxBlur(ref, w, h, Math.max(1, r >> 1), 3);   // field has no box artefacts in it
+  for (let i = 0; i < n * 3; i++) {
+    cur[i] = Math.pow(2, cur[i]) - lfloor;
+    ref[i] = Math.pow(2, ref[i]) - lfloor;
+  }
+
+  /* The ratio blows up where the composite is near black — a pixel at 1 going
+     to 40 is a ratio of 40. The guard belongs on the DENOMINATOR only. Adding
+     the same floor to both, which is the obvious thing to write, drags every
+     ratio toward 1 whenever either side is small, and that is a systematic
+     lift of exactly the tones a night image most needs to keep: measured on a
+     day-to-night field it put the 10th-percentile luminance at 20.9 where the
+     target was 8.9, which is the milky-blacks look. */
+  const floor = 3 + (R.protect / 100) * 22;
+  const ratio = new Float32Array(n * 3);
+  const colour = R.colour / 100;
+  for (let i = 0; i < n; i++) {
+    let lr = 0;
+    for (let c = 0; c < 3; c++) {
+      const q = clamp(ref[i * 3 + c] / Math.max(cur[i * 3 + c], floor), 0.02, 8);
+      ratio[i * 3 + c] = q; lr += q;
+    }
+    lr /= 3;
+    // colour < 100 keeps the reference's brightness but discards its cast,
+    // for when the relight is well judged in light and wrong in white balance.
+    if (colour < 1) for (let c = 0; c < 3; c++) ratio[i * 3 + c] = lr + (ratio[i * 3 + c] - lr) * colour;
+  }
+
+  /* Encode log2(ratio) so the canvas can do the smooth upscale to full size —
+     a ratio field interpolates correctly in log space, not linear.
+
+     What gets encoded is the ratio's deviation from its own geometric mean,
+     with the mean carried alongside as an exact number. A day-to-night field
+     spans about nine stops end to end, and 8 bits stretched across that is
+     3.5% per level, coarse enough to band a smooth sky. Taking the overall
+     exposure out first leaves only the spatial variation to quantise, so the
+     scale can stay fine (1.7% per level) and the big exposure change is not
+     quantised at all. */
+  const gm = [0, 0, 0];
+  for (let c = 0; c < 3; c++) {
+    let s = 0;
+    for (let i = 0; i < n; i++) s += Math.log2(ratio[i * 3 + c]);
+    gm[c] = Math.pow(2, s / n);
+  }
+  const enc = cvOf(w, h);
+  const ex = enc.getContext("2d");
+  const eid = ex.createImageData(w, h);
+  for (let i = 0; i < n; i++) {
+    for (let c = 0; c < 3; c++) {
+      eid.data[i * 4 + c] = clamp(Math.round(128 + 42 * Math.log2(ratio[i * 3 + c] / gm[c])), 0, 255);
+    }
+    eid.data[i * 4 + 3] = 255;
+  }
+  ex.putImageData(eid, 0, 0);
+
+  const up = cvOf(W, H);
+  const ux = up.getContext("2d");
+  ux.imageSmoothingEnabled = true; ux.imageSmoothingQuality = "high";
+  ux.drawImage(enc, 0, 0, W, H);
+  const ud = ux.getImageData(0, 0, W, H).data;
+
+  const out = ctx.getImageData(0, 0, W, H);
+  const od = out.data;
+  const gmOut = gm;
+  const amt = R.strength / 100;
+  /* Deep shadow is where a relight most often goes wrong: it lifts blacks into
+     grey haze and the frame loses its night. The obvious guard — roll the
+     whole effect off in dark tones — is the wrong one, because in a
+     day-to-night transfer the effect IS the darkening, so backing it off in
+     the shadows keeps them daylight-bright. That was measured as the second
+     half of the milky-blacks problem.
+
+     So suppress the direction rather than the effect. Darkening always applies
+     in full; brightening is what gets held back, and only where the plate is
+     already dark. */
+  const keep = R.keepDark / 100;
+  for (let i = 0; i < od.length; i += 4) {
+    const L = (0.2126 * od[i] + 0.7152 * od[i + 1] + 0.0722 * od[i + 2]) / 255;
+    const dark = keep > 0 ? keep * clamp((0.30 - L) / 0.30, 0, 1) : 0;
+    for (let c = 0; c < 3; c++) {
+      let q = gmOut[c] * Math.pow(2, (ud[i + c] - 128) / 42);
+      if (dark > 0 && q > 1) q = 1 + (q - 1) * (1 - dark);
+      od[i + c] = clamp(od[i + c] * (1 + (q - 1) * amt), 0, 255);
+    }
+  }
+  ctx.putImageData(out, 0, 0);
+}
+
 function renderComposite(targetW, opts = {}) {
   const S = state.scene;
   const base = S.base.img;
@@ -2015,6 +2163,10 @@ function renderComposite(targetW, opts = {}) {
     ctx.drawImage(m, 0, 0);
     ctx.restore();
   }
+
+  /* 5.5 — lighting transfer */
+  const RL = S.relight;
+  if (RL.visible && RL.img && RL.strength > 0) applyRelight(ctx, W, H, RL);
 
   /* 6 — finish */
   const F = S.finish;
@@ -3421,6 +3573,39 @@ function buildLayerStack() {
     },
   }));
 
+  /* 🌗 Lighting transfer */
+  host.appendChild(sectionCard({
+    key: "relight", icon: "🌗", title: "Lighting transfer",
+    meta: S.relight.img ? "loaded" : "none",
+    visible: S.relight.visible,
+    onToggle: () => { S.relight.visible = !S.relight.visible; buildLayerStack(); rerender(); },
+    actions: btnRow([
+      ["1 · ⬇ Plate", () => exportRelightPlate(), "Export a clean plate to relight elsewhere"],
+      ["2 · 📋 Prompt", async () => {
+        const ok = await copyText(RELIGHT_PROMPT);
+        toast(ok ? "Prompt copied — paste it with the plate" : "Couldn't copy — select it by hand");
+      }, "Copy the relight prompt"],
+      ["3 · ⬆ Relit", () => pickRelight(), "Load the relit version back in"],
+      ["✕", () => { S.relight.img = null; S.relight.dataUrl = null; buildLayerStack(); rerender(); }, "Clear"],
+    ]),
+    body: (b) => {
+      const p = document.createElement("p");
+      p.className = "panel-hint"; p.style.margin = "2px 0 8px";
+      p.textContent = S.relight.img
+        ? "Only the light is being taken from that image — every pixel of texture here is still your photograph. Coarseness decides how much of its light shaping comes across; raise it if any of its invented detail starts showing through."
+        : "Sliders can darken a photo but they can't know where light comes from, so a graded night stays flat. This borrows the lighting judgement instead: export the plate, relight it in the free Gemini app, load it back, and only the low-frequency light field is kept. The invented brick and smeared frames are all high-frequency, and they get thrown away.";
+      b.appendChild(p);
+      if (!S.relight.img) return;
+      [
+        { k: "strength", label: "Strength",   min: 0, max: 100 },
+        { k: "scale",    label: "Coarseness", min: 4, max: 60, hint: "raise it if its invented detail shows through" },
+        { k: "colour",   label: "Take colour", min: 0, max: 100, hint: "0 = its brightness only" },
+        { k: "keepDark", label: "Protect shadows", min: 0, max: 100, hint: "stops blacks going milky" },
+        { k: "protect",  label: "Shadow floor", min: 0, max: 100, hint: "tames the ratio in near-black" },
+      ].forEach((sp) => b.appendChild(sliderRow(sp, S.relight, rerender)));
+    },
+  }));
+
   /* 💡 Lights */
   host.appendChild(sectionCard({
     key: "lights", icon: "💡", title: "Lights",
@@ -3865,6 +4050,46 @@ function downloadScene() {
   if (out) downloadUrl(out.toDataURL("image/png"), "composite.png");
 }
 
+/* The plate goes out WITHOUT the relight already applied, and without the
+   finish. Exporting the relit look back into the relighter would compound it
+   a second time, and vignette and grain are a lie about the light that the
+   ratio would faithfully reproduce. */
+function exportRelightPlate() {
+  const S = state.scene;
+  if (!S.base.img) return;
+  const wasRelight = S.relight.visible, wasFinish = S.finish.visible;
+  S.relight.visible = false; S.finish.visible = false;
+  const out = renderComposite(S.base.img.naturalWidth);
+  S.relight.visible = wasRelight; S.finish.visible = wasFinish;
+  if (out) downloadUrl(out.toDataURL("image/png"), "relight-plate.png");
+  status("Plate saved. Relight it, then load it back with ⬆ Relit.", "ok");
+}
+
+function pickRelight() { openPicker("relight"); }
+
+async function setRelightRef(file) {
+  const S = state.scene;
+  if (!S.base.img) { status("Add a main image first.", "err"); return; }
+  try {
+    const dataUrl = await fileToDataUrl(file);
+    const img = await loadImage(dataUrl);
+    const ar = (img.naturalWidth / img.naturalHeight);
+    const base = (S.base.img.naturalWidth / S.base.img.naturalHeight);
+    S.relight.dataUrl = dataUrl; S.relight.img = img; S.relight.visible = true;
+    buildLayerStack(); rerender();
+    // Worth saying out loud: a heavy crop moves the light field off the frame
+    // it is supposed to describe, and the result is subtly wrong everywhere.
+    if (Math.abs(ar - base) / base > 0.06) {
+      status("Loaded — but that came back a different shape, so the light is stretched to fit. Re-export uncropped for a clean match.", "err");
+    } else {
+      status("Lighting transferred ✓ — texture is still your photograph.", "ok");
+    }
+  } catch (err) {
+    console.error(err);
+    status("Couldn't read that image.", "err");
+  }
+}
+
 /* ---------------- Relight handoff ---------------- */
 const RELIGHT_PROMPT =
   "Turn this composite into a single, believable photograph. The scene has elements that were pasted in — " +
@@ -3896,6 +4121,7 @@ function newSession() {
     glow: { visible: false, count: 0, size: 30, spread: 60, cy: 62, intensity: 65, hue: 68, seed: 7 },
     lights: [],
     windows: { visible: false, list: [], warmth: 34, brightness: 62, spill: 45, variation: 35, seed: 5 },
+    relight: { visible: true, dataUrl: null, img: null, strength: 100, scale: 10, colour: 100, protect: 20, keepDark: 45 },
     night: { visible: false, amount: 0, skyHue: 220, skySat: 22, skyDark: 78, skyDetail: 70, shadowCool: 18, lightWarm: 55, horizonGlow: 35, glowSide: 70, stars: 0, lampWarmth: 72, skyDetect: 50, skyFeather: 30, skyEdge: 70, skyTighten: 0, skyBurn: 0, skyDodge: 0, ambient: 42, killDaylight: 78, seed: 3 },
     refine: { reach: 45, strength: 80, spill: 80 },
     selectedId: null, zTop: 1, look: null,
@@ -3928,7 +4154,7 @@ async function init() {
   dom.fileInput.addEventListener("change", (e) => {
     const f = e.target.files?.[0];
     if (f && f.type.startsWith("image/")) {
-      ({ cut: cutSetSource, scene: sceneSetBase, overlay: setOverlay })[uploadTarget](f);
+      ({ cut: cutSetSource, scene: sceneSetBase, overlay: setOverlay, relight: setRelightRef })[uploadTarget](f);
     }
     dom.fileInput.value = "";
   });
