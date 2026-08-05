@@ -735,9 +735,56 @@ function detectSky(img, { threshold = 50, feather = 30 } = {}) {
 
   const tol = 0.10 + (threshold / 100) * 0.42;
   const gStop = 0.055 + (1 - threshold / 100) * 0.05;
-  const tight = fill(tol * 0.80, gStop * 0.80);             // certainly sky
-  const loose = fill(tol * 1.30, gStop * 1.45);             // certainly not, beyond this
-  const inSky = fill(tol, gStop);                           // the working estimate
+  let tight = fill(tol * 0.80, gStop * 0.80);               // certainly sky
+  let loose = fill(tol * 1.30, gStop * 1.45);               // certainly not, beyond this
+  let inSky = fill(tol, gStop);                             // the working estimate
+
+  /* Sky that clips to white loses its colour, so a fill measuring distance
+     from a coloured seed stops dead at the clip point. On a backlit facade
+     that left a wedge of blown sky (luma 234-250, texture 0-2 out of 255)
+     unclaimed directly beside sky the fill had already taken, and the night
+     pass then re-exposed one half of the sky and not the other, leaving a hard
+     seam across open air.
+
+     So continue each fill through connected near-white, texture-free pixels.
+     The threshold is the found sky's own median luminance, not a constant, so
+     it tracks the exposure of the photograph rather than assuming one. And
+     connectivity does the semantic work that brightness alone cannot: bright
+     balcony glazing in the same frame measures much the same, but it is
+     separated from the sky by dark brick, so the fill never reaches it. */
+  {
+    const ls = [];
+    for (let i = 0; i < N; i++) if (inSky[i]) ls.push(lum[i]);
+    if (ls.length > 32) {
+      ls.sort((a, b) => a - b);
+      const med = ls[ls.length >> 1];
+      const blowL = Math.max(0.80, med - 0.02);
+      // Only worth doing when the sky actually reaches the top of the range;
+      // an overcast grey sky has no clipped region to recover.
+      if (ls[ls.length - 1] > 0.88) {
+        const spread = (hit, gs) => {
+          const out = Uint8Array.from(hit);
+          const q = [];
+          for (let i = 0; i < N; i++) if (out[i]) q.push(i);
+          while (q.length) {
+            const i = q.pop();
+            const x = i % W, y = (i / W) | 0;
+            for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+              const nx = x + dx, ny = y + dy;
+              if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+              const ni = ny * W + nx;
+              if (out[ni] || lum[ni] < blowL || grad[ni] > gs) continue;
+              out[ni] = 1; q.push(ni);
+            }
+          }
+          return out;
+        };
+        tight = spread(tight, gStop * 0.80);
+        inSky = spread(inSky, gStop);
+        loose = spread(loose, gStop * 1.45);
+      }
+    }
+  }
 
   /* Power lines, aerials and bare branches are strong gradients, so the fill
      stops dead at every one of them and leaves the sky sliced into strips —
