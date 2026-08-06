@@ -1960,6 +1960,92 @@ function applyLightField(ctx, W, H, ratio, w, h, R) {
      for free, and it is most of what makes a night street read as a street
      rather than a flat dark wall.
 --------------------------------------------------------------------------- */
+/* How much of the sky each point can see — a horizon integral, not a ceiling
+   height. The first version of this marched straight up each column, which
+   knows about rooflines and nothing else: a corner of a building and the
+   middle of a blank facade came out identical, and the sides of an archway
+   came out as bright as its mouth. The measurable symptom was that the solve
+   REDUCED the picture's large-scale variation (40.1 to 24.2 on the test
+   facade) when a night should have more of it than a day, not 40% less.
+
+   So sweep a fan of directions across the upper hemisphere and ask each one
+   how far it travels before it reaches open sky. A ray that leaves the frame
+   counts as having got there, which is the honest reading — the scene carries
+   on past the edge and there is probably sky out in it — and it is what makes
+   the outer corners of a building brighter than the middle of a canyon.
+
+   Solved on a coarse grid because the answer is smooth by construction, and
+   cached, because nothing about it changes while you move a light around. */
+function skyOpenness(skyA, w, h, canyonFrac) {
+  const S = state.scene;
+  const sig = `${S.base.token}|${S.skyEditRev || 0}|${S.night.skyDetect}|${canyonFrac.toFixed(4)}|${w}x${h}`;
+  if (S._openCache && S._openCache.sig === sig) return S._openCache.data;
+
+  const cw = Math.max(40, Math.min(132, w)), ch = Math.max(40, Math.round(cw * h / w));
+  const s = new Float32Array(cw * ch);
+  for (let y = 0; y < ch; y++) {
+    const sy = Math.min(h - 1, ((y + 0.5) * h / ch) | 0);
+    for (let x = 0; x < cw; x++) {
+      s[y * cw + x] = skyA[sy * w + Math.min(w - 1, ((x + 0.5) * w / cw) | 0)];
+    }
+  }
+
+  /* Sixteen directions, and the fan is rotated by a per-pixel amount. Nine
+     un-jittered rays left visible streaks radiating out of every building
+     corner — the standard under-sampling artefact, and obvious enough in the
+     field to survive into the picture. Jittering trades that structured
+     banding for unstructured noise, which a small blur then removes; banding
+     cannot be blurred away without taking the signal with it. Affordable
+     because this is cached and does not re-run while a light is dragged. */
+  const K = 16;
+  const canyon = Math.max(1, canyonFrac * ch);
+  const step = 1.6;
+  const maxSteps = Math.max(8, Math.round((ch * 0.85) / step));
+  const out = new Float32Array(cw * ch);
+  const span = 2.56;
+  for (let y = 0; y < ch; y++) {
+    for (let x = 0; x < cw; x++) {
+      if (s[y * cw + x] > 0.5) { out[y * cw + x] = 1; continue; }   // this IS sky
+      // cheap hash jitter: deterministic, so the field is reproducible
+      const jit = (((x * 73856093) ^ (y * 19349663)) >>> 8 & 1023) / 1023 - 0.5;
+      let acc = 0;
+      for (let k = 0; k < K; k++) {
+        const a = -span / 2 + (span * (k + 0.5 + jit)) / K;
+        const dx = Math.sin(a) * step, dy = -Math.cos(a) * step;
+        let d = maxSteps;
+        for (let t = 1; t <= maxSteps; t++) {
+          const sx = (x + dx * t) | 0, sy2 = (y + dy * t) | 0;
+          if (sx < 0 || sx >= cw || sy2 < 0) { d = t; break; }       // out of frame = open
+          if (sy2 >= ch) { d = maxSteps; break; }
+          if (s[sy2 * cw + sx] > 0.5) { d = t; break; }
+        }
+        acc += Math.exp(-(d * step) / canyon);
+      }
+      out[y * cw + x] = acc / K;
+    }
+  }
+  boxBlur(out, cw, ch, 1, 1);   // clears the jitter noise, keeps the structure
+
+  // Smooth upscale through the canvas — the field has no business being crisp.
+  const c = cvOf(cw, ch), cx2 = c.getContext("2d");
+  const id = cx2.createImageData(cw, ch);
+  for (let i = 0; i < cw * ch; i++) {
+    const v = clamp(Math.round(out[i] * 255), 0, 255);
+    id.data[i * 4] = id.data[i * 4 + 1] = id.data[i * 4 + 2] = v;
+    id.data[i * 4 + 3] = 255;
+  }
+  cx2.putImageData(id, 0, 0);
+  const up = cvOf(w, h), ux = up.getContext("2d");
+  ux.imageSmoothingEnabled = true; ux.imageSmoothingQuality = "high";
+  ux.drawImage(c, 0, 0, w, h);
+  const ud = ux.getImageData(0, 0, w, h).data;
+  const data = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) data[i] = ud[i * 4] / 255;
+
+  S._openCache = { sig, data };
+  return data;
+}
+
 function solveNightField(ctx, W, H, NS) {
   const S = state.scene;
   const cap = 480;
@@ -1996,16 +2082,7 @@ function solveNightField(ctx, W, H, NS) {
     const sd = skyDataAt(w, h);
     for (let i = 0; i < n; i++) skyA[i] = sd[i * 4] / 255;
   }
-  const openness = new Float32Array(n);
-  const canyon = Math.max(0.02, (NS.canyon / 100) * 0.9) * h;
-  for (let x = 0; x < w; x++) {
-    let dist = 0;
-    for (let y = 0; y < h; y++) {
-      const i = y * w + x;
-      dist = skyA[i] > 0.5 ? 0 : dist + 1;
-      openness[i] = Math.exp(-dist / canyon);
-    }
-  }
+  const openness = skyOpenness(skyA, w, h, Math.max(0.02, (NS.canyon / 100) * 0.9));
   /* Painted correction to how much sky a surface sees. The column march is a
      crude horizon and it has no idea about a recess, a soffit or a wall facing
      away, so this is where you say so. */
