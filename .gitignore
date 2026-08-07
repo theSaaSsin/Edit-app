@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+assets/inputs/
+assets/cutouts/
+assets/outputs/
+backend/models/
+.env

@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Tuple
 from PIL import Image
+from pathlib import Path
 import io
 import json
 
@@ -350,6 +351,257 @@ async def clear_history():
     """Clear workflow history."""
     orchestrator.clear_history()
     return {"status": "success", "message": "History cleared"}
+
+
+@app.post("/edge-fx")
+async def edge_fx(
+    file: UploadFile = File(...),
+    style: str = "torn_paper",
+    intensity: float = 1.0,
+    width: int = 24,
+    seed: Optional[int] = None,
+):
+    """
+    Apply a procedural edge material to a cutout.
+
+    Styles: none, torn_paper, tissue, flesh, sticker, burnt.
+    CPU-only — no GPU or torch required.
+    """
+    try:
+        from backend.pipeline.edge_fx import EdgeFXEngine
+
+        contents = await file.read()
+        cutout = Image.open(io.BytesIO(contents))
+
+        result = EdgeFXEngine().apply(
+            cutout, style=style, intensity=intensity, width=width, seed=seed
+        )
+        output_path = asset_manager.save_output(result, name=f"fx_{style}_{file.filename}")
+
+        return {
+            "status": "success",
+            "style": style,
+            "file_path": output_path,
+            "size": result.size,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Edge FX endpoint failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Video Carousel Endpoints
+
+video_engine = None
+
+def get_video_engine():
+    """Lazy load video engine."""
+    global video_engine
+    if video_engine is None:
+        from backend.pipeline.video_engine import VideoCarouselEngine
+        video_engine = VideoCarouselEngine()
+    return video_engine
+
+
+class CarouselTimelineRequest(BaseModel):
+    total_slides: int = 4
+    duration: int = 10
+    fps: int = 30
+
+
+class CarouselSliceRequest(BaseModel):
+    quality: str = "medium"
+
+
+class CarouselAudioRequest(BaseModel):
+    audio_path: str
+
+
+@app.post("/carousel/timeline")
+async def carousel_timeline(
+    background: UploadFile = File(...),
+    cutout: UploadFile = File(...),
+    request: CarouselTimelineRequest = None
+):
+    """
+    Create carousel timeline specification.
+
+    Returns: {"status": "success", "specs": {...}}
+    """
+    try:
+        engine = get_video_engine()
+
+        bg_contents = await background.read()
+        bg_image = Image.open(io.BytesIO(bg_contents))
+
+        cutout_contents = await cutout.read()
+        cutout_image = Image.open(io.BytesIO(cutout_contents))
+
+        result = engine.create_carousel_timeline(
+            total_slides=request.total_slides,
+            duration=request.duration,
+            background_image=bg_image,
+            cutout_image=cutout_image,
+            fps=request.fps
+        )
+
+        return result
+    except Exception as e:
+        logger.error(f"Carousel timeline endpoint failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/carousel/slice")
+async def carousel_slice(
+    master_video: UploadFile = File(...),
+    total_slides: int = 4,
+    quality: str = "medium"
+):
+    """
+    Slice master panoramic video into Instagram carousel panels.
+
+    Returns: {"status": "success", "panels": [paths...]}
+    """
+    try:
+        engine = get_video_engine()
+
+        contents = await master_video.read()
+        video_path = str(Path(Config.INPUTS_PATH) / master_video.filename)
+        with open(video_path, "wb") as f:
+            f.write(contents)
+
+        output_dir = str(Path(Config.OUTPUTS_PATH) / "carousel_panels")
+
+        result = engine.slice_carousel_video(
+            video_path,
+            output_dir,
+            total_slides=total_slides,
+            quality=quality
+        )
+
+        return result
+    except Exception as e:
+        logger.error(f"Carousel slice endpoint failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/carousel/parse-srt")
+async def carousel_parse_srt(srt_file: UploadFile = File(...)):
+    """
+    Parse SRT subtitle file into lyric frames.
+
+    Returns: {"status": "success", "lyrics": [...]}
+    """
+    try:
+        engine = get_video_engine()
+
+        contents = await srt_file.read()
+        srt_path = f"/tmp/{srt_file.filename}"
+        with open(srt_path, "wb") as f:
+            f.write(contents)
+
+        lyrics = engine.parse_srt_file(srt_path)
+
+        lyric_dicts = [
+            {
+                "start_time": l.start_time,
+                "end_time": l.end_time,
+                "text": l.text,
+                "position": l.position
+            }
+            for l in lyrics
+        ]
+
+        return {"status": "success", "lyrics": lyric_dicts, "count": len(lyrics)}
+    except Exception as e:
+        logger.error(f"SRT parse endpoint failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/carousel/parse-lrc")
+async def carousel_parse_lrc(lrc_file: UploadFile = File(...)):
+    """
+    Parse LRC lyrics file into lyric frames.
+
+    Returns: {"status": "success", "lyrics": [...]}
+    """
+    try:
+        engine = get_video_engine()
+
+        contents = await lrc_file.read()
+        lrc_path = f"/tmp/{lrc_file.filename}"
+        with open(lrc_path, "wb") as f:
+            f.write(contents)
+
+        lyrics = engine.parse_lrc_file(lrc_path)
+
+        lyric_dicts = [
+            {
+                "start_time": l.start_time,
+                "end_time": l.end_time,
+                "text": l.text,
+                "position": l.position
+            }
+            for l in lyrics
+        ]
+
+        return {"status": "success", "lyrics": lyric_dicts, "count": len(lyrics)}
+    except Exception as e:
+        logger.error(f"LRC parse endpoint failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/carousel/add-audio")
+async def carousel_add_audio(
+    video: UploadFile = File(...),
+    audio: UploadFile = File(...)
+):
+    """
+    Attach audio track to video.
+
+    Returns: {"status": "success", "output": path}
+    """
+    try:
+        engine = get_video_engine()
+
+        video_contents = await video.read()
+        video_path = str(Path(Config.INPUTS_PATH) / video.filename)
+        with open(video_path, "wb") as f:
+            f.write(video_contents)
+
+        audio_contents = await audio.read()
+        audio_path = str(Path(Config.INPUTS_PATH) / audio.filename)
+        with open(audio_path, "wb") as f:
+            f.write(audio_contents)
+
+        output_path = str(Path(Config.OUTPUTS_PATH) / f"with_audio_{video.filename}")
+
+        result = engine.add_audio_track(video_path, audio_path, output_path)
+        return result
+    except Exception as e:
+        logger.error(f"Add audio endpoint failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/carousel/validate")
+async def carousel_validate(
+    panel_count: int = 4,
+    canvas_width: int = 4320,
+    canvas_height: int = 1350
+):
+    """
+    Validate carousel layout parameters.
+
+    Returns: {"valid": bool, "issues": [...], "recommendations": [...]}
+    """
+    try:
+        engine = get_video_engine()
+        result = engine.validate_carousel_layout(panel_count, canvas_width, canvas_height)
+        return result
+    except Exception as e:
+        logger.error(f"Validate endpoint failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":

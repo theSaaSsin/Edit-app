@@ -1,0 +1,15 @@
+# Minimal CPU-only install. No torch, no CUDA — runs on any laptop.
+# Covers: edge-FX engine, compositor, video carousel slicing, the CLI.
+# Total download is roughly 60 MB.
+#
+#   pip install -r backend/requirements-cpu.txt
+#
+# For background removal add rembg (pulls onnxruntime, ~120 MB, still CPU-only):
+#   pip install "rembg[cpu]"
+#
+# The segmentation/depth/relighting engines in backend/pipeline need the full
+# requirements.txt and a CUDA GPU to be practical.
+
+numpy>=1.24
+pillow>=10.0
+opencv-python-headless>=4.8
