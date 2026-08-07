@@ -141,6 +141,19 @@ class RemoteRelighter:
         text = str(error)
         lowered = text.lower()
 
+        # Checked before the auth cases: a proxy that refuses the tunnel puts
+        # "403 Forbidden" in the message, which a substring check misreads as an
+        # authorisation failure and sends the user after a token needlessly.
+        if type(error).__name__ in ("ProxyError", "ConnectionError", "ConnectTimeout",
+                                    "ReadTimeout", "MaxRetryError", "SSLError"):
+            return (f"could not reach the network. Check your connection or proxy settings "
+                    f"(HTTPS_PROXY / NO_PROXY). ({text[:160]})")
+        if any(k in lowered for k in ("unable to connect to proxy", "tunnel connection failed",
+                                      "max retries exceeded", "connection refused",
+                                      "name or service not known")):
+            return (f"could not reach the network — this looks like a proxy or DNS failure, "
+                    f"not an authorisation problem. ({text[:160]})")
+
         if "quota" in lowered:
             return (
                 f"GPU quota exceeded on the Space. Wait for the window to reset, or use a "

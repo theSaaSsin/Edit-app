@@ -11,9 +11,12 @@ Runs without torch, so it works on any laptop:
 
 import argparse
 import logging
+import os
 import sys
+import time
 from pathlib import Path
 
+import numpy as np
 from PIL import Image
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -145,6 +148,134 @@ def cmd_relight(args) -> int:
         )
     logger.info("wrote %s via %s backend", out, backend)
     return 0
+
+
+def cmd_edit(args) -> int:
+    """Send an image to a remote image-edit Space (Qwen-Image-Edit and friends)."""
+    from backend.services.remote_edit import (
+        KNOWN_EDIT_SPACES, RemoteEditError, RemoteImageEditor, probe_spaces,
+    )
+
+    if args.probe:
+        for r in probe_spaces(args.space.split(",") if args.space else None):
+            mark = "✓" if r["reachable"] else "·"
+            print(f"  {mark} {r['space']}")
+            if r["reachable"]:
+                print(f"      endpoint {r['endpoint']}  params {r.get('parameters', [])[:8]}")
+            else:
+                print(f"      {r['error']}")
+        return 0
+
+    if not args.input or not args.output or not args.prompt:
+        logger.error("input, output and --prompt are required unless --probe is given")
+        return 1
+
+    space = args.space or os.environ.get("EDIT_SPACE") or KNOWN_EDIT_SPACES[0]
+    try:
+        result = RemoteImageEditor(space, api_name=args.api_name).edit(
+            Image.open(args.input),
+            prompt=args.prompt,
+            negative_prompt=args.negative,
+            seed=args.seed,
+            preserve_alpha=not args.no_preserve_alpha,
+        )
+    except (RemoteEditError, ValueError) as e:
+        logger.error("%s", e)
+        return 1
+
+    out = Path(args.output)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    result.save(out)
+    logger.info("wrote %s via %s", out, space)
+    return 0
+
+
+def cmd_workflow(args) -> int:
+    """Run the full local chain: cutout, edge material, texture, report."""
+    from backend.pipeline import gmic_fx
+    from backend.pipeline.edge_fx import EdgeFXEngine
+
+    sources = []
+    for pattern in args.inputs:
+        path = Path(pattern)
+        if path.is_dir():
+            for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp", "*.JPG", "*.PNG"):
+                sources.extend(sorted(path.glob(ext)))
+        else:
+            sources.append(path)
+    if not sources:
+        logger.error("no input images found")
+        return 1
+
+    out_dir = Path(args.output)
+    (out_dir / "cutouts").mkdir(parents=True, exist_ok=True)
+    (out_dir / "assets").mkdir(parents=True, exist_ok=True)
+
+    try:
+        from rembg import new_session, remove
+        session = new_session(args.model)
+    except ImportError:
+        logger.error('rembg is required. Run: pip install "rembg[cpu]"')
+        return 1
+
+    engine = EdgeFXEngine()
+    texture_ok = args.texture != "none" and gmic_fx.is_available()
+    if args.texture != "none" and not texture_ok:
+        logger.warning("G'MIC unavailable; skipping the '%s' texture", args.texture)
+
+    report = []
+    for path in sources:
+        try:
+            source = Image.open(path).convert("RGBA")
+            t0 = time.time()
+            cut = remove(source, session=session)
+            t_cut = time.time() - t0
+
+            alpha = np.array(cut.convert("RGBA"))[..., 3]
+            coverage = float((alpha > 128).mean())
+            soft = float(((alpha > 16) & (alpha < 240)).mean())
+
+            cut.save(out_dir / "cutouts" / f"{path.stem}.png")
+
+            t0 = time.time()
+            asset = engine.apply(cut, style=args.style, intensity=args.intensity,
+                                 width=args.width, seed=args.seed)
+            t_fx = time.time() - t0
+
+            t_tex = 0.0
+            if texture_ok:
+                t0 = time.time()
+                asset = gmic_fx.apply_preset(asset, args.texture, strength=args.texture_strength)
+                t_tex = time.time() - t0
+
+            asset.save(out_dir / "assets" / f"{path.stem}_{args.style}.png")
+            report.append({
+                "file": path.name, "size": f"{source.width}x{source.height}",
+                "coverage": coverage, "soft_edge": soft,
+                "t_cut": t_cut, "t_fx": t_fx, "t_tex": t_tex, "ok": True,
+            })
+            logger.info("processed %s", path.name)
+        except Exception as e:
+            logger.error("failed on %s: %s", path.name, e)
+            report.append({"file": path.name, "ok": False, "error": str(e)[:90]})
+
+    print(f"\n  {'file':28s} {'size':>11s} {'subj%':>6s} {'soft%':>6s} {'cut':>6s} {'fx':>6s} {'tex':>6s}")
+    print("  " + "-" * 76)
+    for r in report:
+        if not r["ok"]:
+            print(f"  {r['file'][:28]:28s} FAILED  {r['error']}")
+            continue
+        print(f"  {r['file'][:28]:28s} {r['size']:>11s} {r['coverage']*100:5.1f}% "
+              f"{r['soft_edge']*100:5.2f}% {r['t_cut']:5.1f}s {r['t_fx']:5.2f}s {r['t_tex']:5.2f}s")
+
+    good = [r for r in report if r.get("ok")]
+    if good:
+        avg_soft = sum(r["soft_edge"] for r in good) / len(good)
+        print(f"\n  soft-edge pixels average {avg_soft*100:.2f}% — this tracks how much fine "
+              f"detail\n  (hair, fur, fabric) the matte kept. Below ~1% on a subject with hair "
+              f"means\n  strands are being cut off; try --model birefnet-portrait.")
+    print(f"\n  cutouts → {out_dir / 'cutouts'}\n  assets  → {out_dir / 'assets'}\n")
+    return 0 if good else 1
 
 
 def cmd_doctor(args) -> int:
@@ -394,6 +525,38 @@ def build_parser() -> argparse.ArgumentParser:
     co.add_argument("--opaque", action="store_true", help="white background instead of transparent")
     co.add_argument("--seed", type=int, default=None)
     co.set_defaults(func=cmd_collage)
+
+    wf = sub.add_parser("workflow", help="full chain: cutout, edge material, texture")
+    wf.add_argument("inputs", nargs="+", help="images, or directories of them")
+    wf.add_argument("output", help="output directory")
+    wf.add_argument("--style", default="torn_paper",
+                    choices=["none", "torn_paper", "tissue", "flesh", "sticker", "burnt"])
+    wf.add_argument("--texture", default="none", help="G'MIC preset, or 'none'")
+    wf.add_argument("--texture-strength", type=float, default=1.0)
+    wf.add_argument("--intensity", type=float, default=1.0)
+    wf.add_argument("--width", type=int, default=24, help="edge width in px")
+    wf.add_argument("--seed", type=int, default=7)
+    # isnet-general-use is the default because u2net removes fine hair
+    # entirely: on a test subject with 320 strands it returned a bald
+    # silhouette (15% of the strand ring opaque) where isnet kept them (35%
+    # opaque, 25% partial). birefnet-portrait holds strands too but leaks
+    # patches of background, and is ~8x slower.
+    wf.add_argument("--model", default="isnet-general-use",
+                    help="rembg model: isnet-general-use (best for hair), u2net (fast, "
+                         "loses strands), birefnet-portrait (slow, can leak background)")
+    wf.set_defaults(func=cmd_workflow)
+
+    ed = sub.add_parser("edit", help="edit an image on a remote Space (Qwen-Image-Edit)")
+    ed.add_argument("input", nargs="?")
+    ed.add_argument("output", nargs="?")
+    ed.add_argument("--prompt", default=None, help="edit instruction")
+    ed.add_argument("--negative", default="")
+    ed.add_argument("--space", default=None, help="Space id (or set EDIT_SPACE)")
+    ed.add_argument("--api-name", default=None, help="force a specific endpoint")
+    ed.add_argument("--seed", type=int, default=0)
+    ed.add_argument("--no-preserve-alpha", action="store_true")
+    ed.add_argument("--probe", action="store_true", help="check which Spaces are reachable")
+    ed.set_defaults(func=cmd_edit)
 
     dr = sub.add_parser("doctor", help="check what is installed and what it unlocks")
     dr.set_defaults(func=cmd_doctor)
