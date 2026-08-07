@@ -152,6 +152,13 @@ def cmd_doctor(args) -> int:
     import importlib.util
     import shutil
 
+    def _has_csrt() -> bool:
+        try:
+            import cv2
+            return hasattr(cv2, "TrackerCSRT")
+        except ImportError:
+            return False
+
     def has(module: str) -> bool:
         try:
             return importlib.util.find_spec(module) is not None
@@ -172,6 +179,8 @@ def cmd_doctor(args) -> int:
          "sudo apt install ffmpeg"),
         ("gradio_client", has("gradio_client"), "remote GPU relighting",
          "pip install gradio_client"),
+        ("opencv contrib (CSRT)", _has_csrt(), "accurate object tracking",
+         "pip install opencv-contrib-python"),
         ("torch", has("torch"), "local GPU relighting (needs CUDA)",
          "pip install -r backend/requirements.txt"),
     ]
@@ -209,6 +218,9 @@ def cmd_doctor(args) -> int:
         print("  python -m backend.cli gmic in.png out.png --preset oil_paint")
     if shutil.which("ffmpeg"):
         print("  python -m backend.cli slice master.mp4 panels/")
+        print("  python -m backend.cli audio track.mp3 --describe")
+    if has("cv2"):
+        print("  python -m backend.cli track clip.mp4 motion.json")
     print()
     return 0 if core_ok else 1
 
@@ -251,6 +263,81 @@ def cmd_studio(args) -> int:
 
     argv = ["studio"] + ([args.image] if args.image else [])
     return studio_main(argv)
+
+
+def cmd_track(args) -> int:
+    """Track a subject through a clip and write a reusable motion log."""
+    from backend.pipeline.tracker import detect_initial_bbox, track
+
+    if args.bbox:
+        try:
+            bbox = tuple(int(v) for v in args.bbox.split(","))
+            if len(bbox) != 4:
+                raise ValueError
+        except ValueError:
+            logger.error("--bbox must be four integers: x,y,w,h")
+            return 1
+    else:
+        bbox = detect_initial_bbox(args.input, method=args.detect)
+        logger.info("auto-detected starting box (%s): %s", args.detect, bbox)
+
+    def progress(frame, total):
+        logger.info("  frame %d/%s", frame, total or "?")
+
+    log = track(
+        args.input, bbox, tracker=args.tracker,
+        max_frames=args.max_frames, smooth=args.smooth,
+        on_progress=progress if args.verbose else None,
+    )
+
+    log.to_json(args.output)
+    held = log.found_ratio() * 100
+    logger.info("tracked %d frames, subject held on %.0f%%", log.frame_count, held)
+    if held < 80:
+        logger.warning("low hold rate — try --bbox with a tighter box, or --tracker mil")
+    return 0
+
+
+def cmd_audio(args) -> int:
+    """Inspect a track, or write its per-frame envelope as JSON."""
+    import json
+
+    from backend.pipeline.audio_reactive import (
+        BANDS, band_envelope, describe, onset_envelope,
+    )
+
+    if args.describe:
+        info = describe(args.input)
+        print(f"\n  duration     {info['duration_seconds']}s")
+        print(f"  sample rate  {info['sample_rate']} Hz")
+        print("  band levels (relative)")
+        for name, level in info["band_levels"].items():
+            bar = "█" * int(level * 30)
+            print(f"    {name:9s} {level:5.3f} {bar}")
+        print()
+        return 0
+
+    if not args.output:
+        logger.error("output is required unless --describe is given")
+        return 1
+
+    fn = onset_envelope if args.mode == "onset" else band_envelope
+    envelope = fn(args.input, args.frames, args.fps, band=args.band)
+
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.output).write_text(json.dumps({
+        "source": args.input, "band": args.band, "mode": args.mode,
+        "fps": args.fps, "frame_count": args.frames,
+        "envelope": [round(float(v), 4) for v in envelope],
+    }, indent=2))
+
+    peaks = sum(
+        1 for i in range(1, len(envelope) - 1)
+        if envelope[i] > 0.45 and envelope[i] >= envelope[i - 1] and envelope[i] > envelope[i + 1]
+    )
+    logger.info("wrote %s (%d frames, %d peaks in the %s band)",
+                args.output, len(envelope), peaks, args.band)
+    return 0
 
 
 def cmd_slice(args) -> int:
@@ -337,6 +424,31 @@ def build_parser() -> argparse.ArgumentParser:
     rl.add_argument("--require-remote", action="store_true",
                     help="fail instead of silently using the local fallback")
     rl.set_defaults(func=cmd_relight)
+
+    tr = sub.add_parser("track", help="track a subject and write a motion log")
+    tr.add_argument("input", help="source video")
+    tr.add_argument("output", help="motion log JSON")
+    tr.add_argument("--bbox", default=None, help="starting box as x,y,w,h (default: auto)")
+    tr.add_argument("--detect", default="motion", choices=["motion", "centre"],
+                    help="how to pick the box when --bbox is omitted")
+    tr.add_argument("--tracker", default="csrt", choices=["csrt", "kcf", "mil"],
+                    help="csrt = accurate, kcf = fast, mil = base opencv")
+    tr.add_argument("--smooth", type=int, default=7, help="jitter window; 0 disables")
+    tr.add_argument("--max-frames", type=int, default=None)
+    tr.add_argument("--verbose", action="store_true", help="log progress per 10 frames")
+    tr.set_defaults(func=cmd_track)
+
+    au = sub.add_parser("audio", help="extract a beat/energy envelope from a track")
+    au.add_argument("input", help="audio or video file (any format ffmpeg reads)")
+    au.add_argument("output", nargs="?", help="envelope JSON")
+    au.add_argument("--describe", action="store_true", help="show band levels and exit")
+    au.add_argument("--band", default="bass",
+                    choices=["sub_bass", "bass", "low_mid", "mid", "high", "full"])
+    au.add_argument("--mode", default="onset", choices=["onset", "level"],
+                    help="onset = hits only, level = continuous energy")
+    au.add_argument("--fps", type=float, default=30.0)
+    au.add_argument("--frames", type=int, default=300)
+    au.set_defaults(func=cmd_audio)
 
     sl = sub.add_parser("slice", help="cut a wide master video into carousel panels")
     sl.add_argument("input")
