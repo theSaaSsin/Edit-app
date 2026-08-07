@@ -36,6 +36,7 @@ except ImportError as exc:  # pragma: no cover - import guard
         "Collage Studio needs PyQt6.\n\n    pip install PyQt6\n"
     ) from exc
 
+from backend.pipeline import gmic_fx
 from backend.pipeline.edge_fx import EDGE_STYLES, EdgeFXEngine
 from backend.pipeline.selection import SelectionEngine
 
@@ -307,6 +308,30 @@ class StudioWindow(QMainWindow):
             fx_layout.addWidget(widget)
         layout.addWidget(fx_box)
 
+        # Texture / style (G'MIC). Populated from what this install can actually
+        # run, so a partial G'MIC build shows fewer options rather than failing.
+        texture_box = QGroupBox("Texture / style")
+        texture_layout = QVBoxLayout(texture_box)
+        self.texture_combo = QComboBox()
+        self.texture_combo.addItem("none")
+
+        if gmic_fx.is_available():
+            self.texture_combo.addItems(gmic_fx.available_presets())
+            self.texture_combo.currentTextChanged.connect(self.schedule_preview)
+            self.texture_strength = LabelledSlider("Strength", 0, 100, 100, "%")
+            self.texture_strength.slider.sliderReleased.connect(self.schedule_preview)
+            texture_layout.addWidget(self.texture_combo)
+            texture_layout.addWidget(self.texture_strength)
+        else:
+            self.texture_strength = LabelledSlider("Strength", 0, 100, 100, "%")
+            self.texture_combo.setEnabled(False)
+            hint = QLabel("Install G'MIC for texture filters:\nsudo apt install gmic")
+            hint.setWordWrap(True)
+            texture_layout.addWidget(self.texture_combo)
+            texture_layout.addWidget(hint)
+
+        layout.addWidget(texture_box)
+
         layout.addStretch(1)
 
         export_asset = QPushButton("Export asset PNG")
@@ -428,6 +453,7 @@ class StudioWindow(QMainWindow):
                 width=width,
                 seed=7,
             )
+            result = self._apply_texture(result)
             self.preview_canvas.set_image(result)
         except Exception as e:
             logger.exception("preview failed")
@@ -495,14 +521,29 @@ class StudioWindow(QMainWindow):
 
     # ---- export --------------------------------------------------------
 
+    def _apply_texture(self, image: Image.Image) -> Image.Image:
+        """Apply the selected G'MIC preset, if any. Never fatal to a render."""
+        preset = self.texture_combo.currentText()
+        if preset == "none" or not gmic_fx.is_available():
+            return image
+        try:
+            return gmic_fx.apply_preset(
+                image, preset, strength=self.texture_strength.value() / 100.0
+            )
+        except Exception as e:
+            logger.warning("texture %s failed: %s", preset, e)
+            self.statusBar().showMessage(f"Texture '{preset}' failed: {e}")
+            return image
+
     def _full_resolution_asset(self) -> Image.Image:
-        return self.fx.apply(
+        asset = self.fx.apply(
             self.selection.cutout(),
             style=self.style_combo.currentText(),
             intensity=self.fx_intensity_slider.value() / 100.0,
             width=self.fx_width_slider.value(),
             seed=7,
         )
+        return self._apply_texture(asset)
 
     def export_asset(self):
         if not self._require_selection():

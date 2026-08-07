@@ -147,6 +147,112 @@ def cmd_relight(args) -> int:
     return 0
 
 
+def cmd_doctor(args) -> int:
+    """Report what is installed and what each missing piece would unlock."""
+    import importlib.util
+    import shutil
+
+    def has(module: str) -> bool:
+        try:
+            return importlib.util.find_spec(module) is not None
+        except (ImportError, ValueError):
+            return False
+
+    core = [
+        ("numpy", has("numpy")),
+        ("PIL (pillow)", has("PIL")),
+        ("cv2 (opencv)", has("cv2")),
+    ]
+    optional = [
+        ("PyQt6", has("PyQt6"), "desktop studio", "pip install PyQt6"),
+        ("rembg", has("rembg"), "automatic background removal", 'pip install "rembg[cpu]"'),
+        ("gmic", shutil.which("gmic") is not None, "texture and style filters",
+         "sudo apt install gmic  (or brew install gmic)"),
+        ("ffmpeg", shutil.which("ffmpeg") is not None, "video carousel slicing",
+         "sudo apt install ffmpeg"),
+        ("gradio_client", has("gradio_client"), "remote GPU relighting",
+         "pip install gradio_client"),
+        ("torch", has("torch"), "local GPU relighting (needs CUDA)",
+         "pip install -r backend/requirements.txt"),
+    ]
+
+    print("\nCore (required)")
+    core_ok = True
+    for name, ok in core:
+        print(f"  {'✓' if ok else '✗'} {name}")
+        core_ok &= ok
+    if not core_ok:
+        print("\n  Install with:  pip install -r backend/requirements-cpu.txt")
+
+    print("\nOptional")
+    for name, ok, unlocks, how in optional:
+        print(f"  {'✓' if ok else '·'} {name:15s} {unlocks}")
+        if not ok:
+            print(f"      → {how}")
+
+    if shutil.which("gmic"):
+        from backend.pipeline import gmic_fx
+        presets = gmic_fx.available_presets()
+        print(f"\nG'MIC: {gmic_fx.version()}")
+        print(f"  {len(presets)}/{len(gmic_fx.PRESETS)} presets usable on this build")
+        if len(presets) < len(gmic_fx.PRESETS):
+            missing = sorted(set(gmic_fx.PRESETS) - set(presets))
+            print(f"  unavailable here: {', '.join(missing)}")
+
+    print("\nWhat you can run now")
+    if core_ok:
+        print("  python -m backend.cli fx cutout.png out.png --style torn_paper")
+        print("  python -m backend.cli collage cutouts/ collage.png")
+    if has("PyQt6"):
+        print("  python -m backend.cli studio            ← the main app")
+    if shutil.which("gmic"):
+        print("  python -m backend.cli gmic in.png out.png --preset oil_paint")
+    if shutil.which("ffmpeg"):
+        print("  python -m backend.cli slice master.mp4 panels/")
+    print()
+    return 0 if core_ok else 1
+
+
+def cmd_gmic(args) -> int:
+    from backend.pipeline import gmic_fx
+
+    if args.list:
+        if not gmic_fx.is_available():
+            logger.error("G'MIC is not installed. Try: sudo apt install gmic")
+            return 1
+        for name, description, ok in gmic_fx.describe_presets():
+            print(f"  {'✓' if ok else '·'} {name:16s} {description}")
+        return 0
+
+    if not args.input or not args.output:
+        logger.error("input and output are required unless --list is given")
+        return 1
+
+    src = Image.open(args.input)
+    styles = gmic_fx.available_presets() if args.preset == "all" else [args.preset]
+
+    if len(styles) > 1:
+        out_dir = Path(args.output)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        targets = {s: out_dir / f"{Path(args.input).stem}_{s}.png" for s in styles}
+    else:
+        targets = {styles[0]: Path(args.output)}
+        targets[styles[0]].parent.mkdir(parents=True, exist_ok=True)
+
+    for style in styles:
+        result = gmic_fx.apply_preset(src, style, strength=args.strength)
+        result.save(targets[style])
+        logger.info("wrote %s", targets[style])
+    return 0
+
+
+def cmd_studio(args) -> int:
+    from backend.ui.studio import main as studio_main
+
+    argv = ["studio"] + ([args.image] if args.image else [])
+    return studio_main(argv)
+
+
 def cmd_slice(args) -> int:
     from backend.pipeline.video_engine import VideoCarouselEngine
 
@@ -201,6 +307,21 @@ def build_parser() -> argparse.ArgumentParser:
     co.add_argument("--opaque", action="store_true", help="white background instead of transparent")
     co.add_argument("--seed", type=int, default=None)
     co.set_defaults(func=cmd_collage)
+
+    dr = sub.add_parser("doctor", help="check what is installed and what it unlocks")
+    dr.set_defaults(func=cmd_doctor)
+
+    st = sub.add_parser("studio", help="launch the desktop studio")
+    st.add_argument("image", nargs="?", default=None)
+    st.set_defaults(func=cmd_studio)
+
+    gm = sub.add_parser("gmic", help="apply a G'MIC texture or style preset")
+    gm.add_argument("input", nargs="?")
+    gm.add_argument("output", nargs="?", help="file, or a directory when --preset all")
+    gm.add_argument("--preset", default="oil_paint", help="preset name, or 'all'")
+    gm.add_argument("--strength", type=float, default=1.0, help="0.0-1.0 blend back to original")
+    gm.add_argument("--list", action="store_true", help="list presets and exit")
+    gm.set_defaults(func=cmd_gmic)
 
     rl = sub.add_parser("relight", help="relight a cutout on a remote GPU Space")
     rl.add_argument("input")

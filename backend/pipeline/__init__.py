@@ -16,6 +16,7 @@ _LAZY = {
     "LyricFrame": ".video_engine",
     "EdgeFXEngine": ".edge_fx",
     "EDGE_STYLES": ".edge_fx",
+    "gmic_fx": ".gmic_fx",
     "TiledCanvas": ".tiles",
     "TileLayer": ".tiles",
     "BLEND_MODES": ".tiles",
