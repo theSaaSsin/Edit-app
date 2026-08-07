@@ -1,296 +1,192 @@
+"""
+Scene compositing: layer stack, contact shadows, colour grading.
+
+Blending is delegated to TiledCanvas so there is a single compositing
+implementation in the codebase, and so a scene built here inherits the tiled
+renderer's memory behaviour on large canvases.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Dict, List, Optional, Sequence, Tuple
+
 import cv2
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter
-from typing import List, Tuple, Optional, Dict
-import logging
+from PIL import Image, ImageFilter
+
+from backend.pipeline.tiles import BLEND_MODES, TiledCanvas, TileLayer
 
 logger = logging.getLogger(__name__)
 
-
-class Layer:
-    """Represents a single compositing layer."""
-
-    def __init__(self, image: Image.Image, name: str = "layer"):
-        self.image = image.convert("RGBA")
-        self.name = name
-        self.opacity = 1.0
-        self.blend_mode = "normal"
-        self.position = (0, 0)
-        self.scale = (1.0, 1.0)
-        self.rotation = 0.0
-        self.visible = True
-
-    def apply_transform(self) -> Image.Image:
-        """Apply position, scale, and rotation to layer."""
-        if self.rotation != 0:
-            self.image = self.image.rotate(self.rotation, expand=False, resample=Image.Resampling.BICUBIC)
-
-        if self.scale != (1.0, 1.0):
-            new_size = (
-                int(self.image.width * self.scale[0]),
-                int(self.image.height * self.scale[1])
-            )
-            self.image = self.image.resize(new_size, Image.Resampling.LANCZOS)
-
-        return self.image
-
-    def set_opacity(self, opacity: float):
-        """Set layer opacity (0-1)."""
-        self.opacity = max(0, min(1, opacity))
-
-    def render(self, canvas_size: Tuple[int, int]) -> Image.Image:
-        """Render layer on transparent background."""
-        transformed = self.apply_transform()
-        canvas = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
-
-        if self.visible:
-            alpha = transformed.split()[3]
-            alpha = alpha.point(lambda p: int(p * self.opacity))
-            transformed.putalpha(alpha)
-            canvas.paste(transformed, self.position, transformed)
-
-        return canvas
+COLOR_GRADES = ("neutral", "warm", "cool", "vintage", "cinematic", "high_contrast")
 
 
 class CompositorEngine:
-    """
-    Final compositing layer orchestration, shadow casting, color grading,
-    and unified color profile management via OpenColorIO.
-    """
+    """A bounded scene canvas with shadow casting and colour grading."""
 
-    def __init__(self):
-        self.layers: List[Layer] = []
-        self.canvas_size = (1920, 1080)
-        self.background_color = (255, 255, 255, 255)
-        logger.info("Initialized CompositorEngine")
+    def __init__(self, canvas_size: Tuple[int, int] = (1920, 1080)):
+        self.canvas = TiledCanvas(background=(0.0, 0.0, 0.0, 0.0))
+        self.canvas_size = canvas_size
 
-    def add_layer(self, image: Image.Image, name: str = None, position: Tuple[int, int] = (0, 0)) -> Layer:
-        """Add a layer to the composition."""
-        layer = Layer(image, name or f"layer_{len(self.layers)}")
-        layer.position = position
-        self.layers.append(layer)
-        logger.info(f"Added layer: {layer.name}")
-        return layer
+    # ---- layers ---------------------------------------------------------
+
+    @property
+    def layers(self) -> List[TileLayer]:
+        return self.canvas.layers
 
     def set_canvas_size(self, width: int, height: int):
-        """Set the canvas size."""
+        if width <= 0 or height <= 0:
+            raise ValueError(f"canvas size must be positive, got {width}x{height}")
         self.canvas_size = (width, height)
-        logger.info(f"Canvas size set to {width}x{height}")
 
-    def set_background(self, image: Image.Image = None, color: Tuple[int, int, int, int] = None):
-        """Set background image or solid color."""
-        if image:
-            self.layers.insert(0, Layer(image, "background"))
-        elif color:
-            self.background_color = color
-
-    def cast_shadows(
-        self,
-        layer_index: int,
-        light_direction: Tuple[float, float] = (1, 1),
-        shadow_softness: int = 10,
-        shadow_opacity: float = 0.5,
-        shadow_distance: int = 15
-    ) -> Image.Image:
-        """
-        Cast realistic drop shadow from layer.
-
-        Args:
-            layer_index: Which layer to cast shadow from
-            light_direction: (x, y) direction of light source
-            shadow_softness: Gaussian blur radius
-            shadow_opacity: Shadow transparency
-            shadow_distance: Offset distance from layer
-
-        Returns:
-            Shadow layer
-        """
-        try:
-            layer = self.layers[layer_index]
-            source = layer.apply_transform()
-
-            alpha = np.array(source.split()[3])
-            shadow = Image.new("RGBA", source.size, (0, 0, 0, 0))
-            shadow_data = np.array(shadow)
-
-            shadow_alpha = (alpha * shadow_opacity * 255).astype(np.uint8)
-            shadow_data[:, :, 3] = shadow_alpha
-
-            shadow = Image.fromarray(shadow_data, "RGBA")
-            shadow = shadow.filter(ImageFilter.GaussianBlur(radius=shadow_softness))
-
-            offset_x = int(light_direction[0] * shadow_distance)
-            offset_y = int(light_direction[1] * shadow_distance)
-
-            shadow_layer = Layer(shadow, f"{layer.name}_shadow")
-            shadow_layer.position = (
-                layer.position[0] + offset_x,
-                layer.position[1] + offset_y
+    def set_background(self, image: Optional[Image.Image] = None,
+                       color: Optional[Sequence[float]] = None):
+        """Set a background image (as the bottom layer) or a flat colour."""
+        if image is not None:
+            resized = image.convert("RGBA").resize(self.canvas_size, Image.Resampling.LANCZOS)
+            layer = TileLayer(
+                image=resized, name="background",
+                position=(self.canvas_size[0] / 2, self.canvas_size[1] / 2),
             )
-            return shadow_layer.render(self.canvas_size)
-        except Exception as e:
-            logger.error(f"Shadow casting failed: {e}")
-            return Image.new("RGBA", self.canvas_size, (0, 0, 0, 0))
+            self.canvas.layers.insert(0, layer)
+        elif color is not None:
+            self.canvas.background = tuple(c / 255.0 if c > 1 else c for c in color)
 
-    def blend_layers(self) -> Image.Image:
-        """Composite all layers using specified blend modes."""
-        canvas = Image.new("RGBA", self.canvas_size, self.background_color)
-        canvas_array = np.array(canvas, dtype=np.float32) / 255.0
+    def add_layer(
+        self,
+        image: Image.Image,
+        name: Optional[str] = None,
+        position: Tuple[int, int] = (0, 0),
+        anchor: str = "topleft",
+        **kwargs,
+    ) -> TileLayer:
+        """
+        Place a layer. `position` is the top-left corner by default, which is what
+        callers passing pixel offsets expect; pass anchor="centre" to position by
+        the layer's centre instead.
+        """
+        image = image.convert("RGBA")
+        if anchor == "topleft":
+            scale = kwargs.get("scale", 1.0)
+            centre = (position[0] + image.width * scale / 2,
+                      position[1] + image.height * scale / 2)
+        elif anchor == "centre":
+            centre = (float(position[0]), float(position[1]))
+        else:
+            raise ValueError(f"anchor must be 'topleft' or 'centre', got {anchor!r}")
 
-        for layer in self.layers:
-            if not layer.visible:
-                continue
-
-            layer_render = layer.render(self.canvas_size)
-            layer_array = np.array(layer_render, dtype=np.float32) / 255.0
-
-            if layer.blend_mode == "normal":
-                canvas_array = self._blend_normal(canvas_array, layer_array)
-            elif layer.blend_mode == "multiply":
-                canvas_array = self._blend_multiply(canvas_array, layer_array)
-            elif layer.blend_mode == "screen":
-                canvas_array = self._blend_screen(canvas_array, layer_array)
-            elif layer.blend_mode == "overlay":
-                canvas_array = self._blend_overlay(canvas_array, layer_array)
-            else:
-                canvas_array = self._blend_normal(canvas_array, layer_array)
-
-        canvas_array = np.clip(canvas_array * 255, 0, 255).astype(np.uint8)
-        return Image.fromarray(canvas_array, "RGBA")
-
-    @staticmethod
-    def _blend_normal(bg: np.ndarray, fg: np.ndarray) -> np.ndarray:
-        """Normal blend mode."""
-        alpha = fg[:, :, 3:4]
-        result = bg * (1 - alpha) + fg * alpha
-        return result
-
-    @staticmethod
-    def _blend_multiply(bg: np.ndarray, fg: np.ndarray) -> np.ndarray:
-        """Multiply blend mode."""
-        alpha = fg[:, :, 3:4]
-        result = bg * fg[:, :, :3] * (1 - alpha) + bg * alpha
-        return np.concatenate([result, bg[:, :, 3:4]], axis=2)
-
-    @staticmethod
-    def _blend_screen(bg: np.ndarray, fg: np.ndarray) -> np.ndarray:
-        """Screen blend mode."""
-        alpha = fg[:, :, 3:4]
-        result = 1 - (1 - bg[:, :, :3]) * (1 - fg[:, :, :3])
-        result = bg[:, :, :3] * (1 - alpha) + result * alpha
-        return np.concatenate([result, bg[:, :, 3:4]], axis=2)
-
-    @staticmethod
-    def _blend_overlay(bg: np.ndarray, fg: np.ndarray) -> np.ndarray:
-        """Overlay blend mode."""
-        alpha = fg[:, :, 3:4]
-        mask = bg[:, :, :3] < 0.5
-        result = np.where(
-            mask,
-            2 * bg[:, :, :3] * fg[:, :, :3],
-            1 - 2 * (1 - bg[:, :, :3]) * (1 - fg[:, :, :3])
+        return self.canvas.add_layer(
+            image, name=name or f"layer_{len(self.layers)}", position=centre, **kwargs
         )
-        result = bg[:, :, :3] * (1 - alpha) + result * alpha
-        return np.concatenate([result, bg[:, :, 3:4]], axis=2)
+
+    # ---- shadows --------------------------------------------------------
+
+    def cast_shadow(
+        self,
+        layer: TileLayer,
+        light_direction: Tuple[float, float] = (1.0, 1.0),
+        distance: int = 18,
+        softness: int = 12,
+        opacity: float = 0.45,
+    ) -> TileLayer:
+        """
+        Insert a soft drop shadow directly beneath `layer` and return it.
+
+        The shadow is a blurred copy of the layer's own alpha, so it follows the
+        real silhouette — including any edge material already applied — rather
+        than a bounding box.
+        """
+        if layer not in self.layers:
+            raise ValueError(f"layer {layer.name!r} is not on this canvas")
+
+        alpha = np.array(layer.image.split()[3])
+        pad = max(softness * 3, 8)
+        alpha = cv2.copyMakeBorder(alpha, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=0)
+
+        if softness > 0:
+            ksize = int(softness) * 2 + 1
+            alpha = cv2.GaussianBlur(alpha, (ksize, ksize), 0)
+        alpha = (alpha.astype(np.float32) * float(np.clip(opacity, 0, 1))).astype(np.uint8)
+
+        shadow_rgba = np.zeros((*alpha.shape, 4), dtype=np.uint8)
+        shadow_rgba[..., 3] = alpha
+        shadow_image = Image.fromarray(shadow_rgba, "RGBA")
+
+        shadow = TileLayer(
+            image=shadow_image,
+            name=f"{layer.name}_shadow",
+            position=(layer.position[0] + light_direction[0] * distance,
+                      layer.position[1] + light_direction[1] * distance),
+            scale=layer.scale,
+            rotation=layer.rotation,
+            blend_mode="normal",
+        )
+        self.canvas.layers.insert(self.layers.index(layer), shadow)
+        return shadow
+
+    # ---- grading --------------------------------------------------------
 
     def apply_color_grade(self, image: Image.Image, grade: str = "neutral") -> Image.Image:
-        """
-        Apply color grading/LUT to composite.
-
-        Args:
-            image: Image to grade
-            grade: "neutral", "warm", "cool", "vintage", "cinematic", "high_contrast"
-
-        Returns:
-            Graded image
-        """
-        try:
-            img_array = np.array(image.convert("RGB"), dtype=np.float32) / 255.0
-
-            grades = {
-                "neutral": lambda x: x,
-                "warm": lambda x: self._grade_warm(x),
-                "cool": lambda x: self._grade_cool(x),
-                "vintage": lambda x: self._grade_vintage(x),
-                "cinematic": lambda x: self._grade_cinematic(x),
-                "high_contrast": lambda x: self._grade_high_contrast(x),
-            }
-
-            grade_fn = grades.get(grade, lambda x: x)
-            graded = grade_fn(img_array)
-
-            graded = np.clip(graded * 255, 0, 255).astype(np.uint8)
-            result = Image.fromarray(graded, "RGB")
-
-            if image.mode == "RGBA":
-                alpha = image.split()[3]
-                result.putalpha(alpha)
-
-            return result
-        except Exception as e:
-            logger.error(f"Color grading failed: {e}")
+        """Apply a colour grade, preserving any alpha channel."""
+        if grade not in COLOR_GRADES:
+            raise ValueError(f"unknown grade {grade!r}, expected one of {COLOR_GRADES}")
+        if grade == "neutral":
             return image
 
-    @staticmethod
-    def _grade_warm(img: np.ndarray) -> np.ndarray:
-        """Warm color grade."""
-        img[:, :, 0] = np.minimum(img[:, :, 0] * 1.1, 1.0)
-        img[:, :, 2] = img[:, :, 2] * 0.9
-        return img
+        rgb = np.array(image.convert("RGB"), dtype=np.float32) / 255.0
 
-    @staticmethod
-    def _grade_cool(img: np.ndarray) -> np.ndarray:
-        """Cool color grade."""
-        img[:, :, 0] = img[:, :, 0] * 0.9
-        img[:, :, 2] = np.minimum(img[:, :, 2] * 1.1, 1.0)
-        return img
+        if grade == "warm":
+            rgb[..., 0] *= 1.10
+            rgb[..., 2] *= 0.90
+        elif grade == "cool":
+            rgb[..., 0] *= 0.90
+            rgb[..., 2] *= 1.10
+        elif grade == "vintage":
+            rgb *= 0.95
+            rgb[..., 0] *= 1.05
+            rgb = rgb * 0.92 + 0.06
+        elif grade == "cinematic":
+            rgb = rgb ** 0.9
+            rgb[..., 0] *= 1.08
+            rgb[..., 1] *= 0.97
+        elif grade == "high_contrast":
+            rgb = (rgb - 0.5) * 1.5 + 0.5
 
-    @staticmethod
-    def _grade_vintage(img: np.ndarray) -> np.ndarray:
-        """Vintage color grade."""
-        img = img * 0.95
-        img[:, :, 0] = np.minimum(img[:, :, 0] * 1.05, 1.0)
-        return img
+        graded = Image.fromarray((np.clip(rgb, 0, 1) * 255).astype(np.uint8), "RGB")
+        if image.mode == "RGBA":
+            graded = graded.convert("RGBA")
+            graded.putalpha(image.split()[3])
+        return graded
 
-    @staticmethod
-    def _grade_cinematic(img: np.ndarray) -> np.ndarray:
-        """Cinematic color grade."""
-        img = img ** 0.9
-        img[:, :, 0] = img[:, :, 0] * 1.1
-        img[:, :, 1] = img[:, :, 1] * 0.95
-        return np.clip(img, 0, 1)
+    # ---- output ---------------------------------------------------------
 
-    @staticmethod
-    def _grade_high_contrast(img: np.ndarray) -> np.ndarray:
-        """High contrast color grade."""
-        return np.clip((img - 0.5) * 1.5 + 0.5, 0, 1)
+    def flatten(self, grade: str = "neutral") -> Image.Image:
+        """Composite the scene over its canvas rectangle."""
+        composite = self.canvas.render_region((0, 0, *self.canvas_size))
+        return self.apply_color_grade(composite, grade)
 
-    def flatten(self) -> Image.Image:
-        """Composite all layers and apply color grading."""
-        composite = self.blend_layers()
-        return composite
-
-    def export(self, filepath: str, format: str = "PNG"):
-        """Export final composite."""
-        try:
-            composite = self.flatten()
-            composite.save(filepath, format=format)
-            logger.info(f"Exported composite to {filepath}")
-            return filepath
-        except Exception as e:
-            logger.error(f"Export failed: {e}")
-            return None
+    def export(self, filepath: str, grade: str = "neutral", format: str = "PNG") -> str:
+        self.flatten(grade).save(filepath, format=format)
+        logger.info("exported composite to %s", filepath)
+        return filepath
 
     def get_layer_positions(self) -> List[Dict]:
-        """Get all layer positions and transforms."""
         return [
             {
-                "name": layer.name,
-                "position": layer.position,
-                "scale": layer.scale,
-                "rotation": layer.rotation,
-                "opacity": layer.opacity,
-                "visible": layer.visible
+                "name": l.name,
+                "position": l.position,
+                "scale": l.scale,
+                "rotation": l.rotation,
+                "opacity": l.opacity,
+                "blend_mode": l.blend_mode,
+                "visible": l.visible,
             }
-            for layer in self.layers
+            for l in self.layers
         ]
+
+
+# Kept so existing imports of `Layer` continue to resolve.
+Layer = TileLayer
+
+__all__ = ["CompositorEngine", "Layer", "COLOR_GRADES", "BLEND_MODES"]

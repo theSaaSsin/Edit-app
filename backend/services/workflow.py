@@ -169,20 +169,22 @@ class WorkflowOrchestrator:
         try:
             logger.info("Starting compositing workflow")
             width, height = background_image.size
-            self.compositor.set_canvas_size(width, height)
+
+            # A fresh compositor per call; reusing one accumulates layers from
+            # every previous composite.
+            self.compositor = CompositorEngine(canvas_size=(width, height))
             self.compositor.set_background(background_image)
 
+            placed = []
             for i, cutout in enumerate(cutout_images):
                 pos = positions[i] if positions and i < len(positions) else (0, 0)
-                self.compositor.add_layer(cutout, name=f"cutout_{i}", position=pos)
+                placed.append(self.compositor.add_layer(cutout, name=f"cutout_{i}", position=pos))
 
             if cast_shadows:
-                for i in range(1, len(self.compositor.layers)):
-                    shadow = self.compositor.cast_shadows(i)
-                    self.compositor.layers.insert(i, cutout_images[i - 1].__class__("RGBA", self.compositor.canvas_size))
+                for layer in placed:
+                    self.compositor.cast_shadow(layer)
 
-            composite = self.compositor.flatten()
-            composite = self.compositor.apply_color_grade(composite, color_grade)
+            composite = self.compositor.flatten(grade=color_grade)
 
             result = {
                 "status": "success",

@@ -16,6 +16,11 @@ _LAZY = {
     "LyricFrame": ".video_engine",
     "EdgeFXEngine": ".edge_fx",
     "EDGE_STYLES": ".edge_fx",
+    "TiledCanvas": ".tiles",
+    "TileLayer": ".tiles",
+    "BLEND_MODES": ".tiles",
+    "SelectionEngine": ".selection",
+    "COLOR_GRADES": ".compositor",
 }
 
 __all__ = list(_LAZY)

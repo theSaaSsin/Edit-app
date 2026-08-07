@@ -1,227 +1,165 @@
-# Quick Start Guide
+# Quick Start
 
-## Setup (2 minutes)
+Two installs, depending on what you want to run.
 
-```bash
-# 1. Install Python dependencies
-cd Edit-app/backend
-pip install -r requirements.txt
+## CPU-only (any laptop, ~60 MB, no GPU)
 
-# 2. Start the backend server
-python main.py
-
-# Server runs at http://localhost:8000
-# API docs at http://localhost:8000/docs
-```
-
-## Basic Usage
-
-### 1. Remove Background from Image
+Covers the parts that make up the collage workflow: selection, edge materials,
+tiled compositing, video carousel slicing, and the desktop studio.
 
 ```bash
-curl -X POST http://localhost:8000/cutout \
-  -F "file=@your_photo.png" \
-  -F "model=rembg"
+pip install -r backend/requirements-cpu.txt
+pip install PyQt6                    # only for the desktop studio
+pip install "rembg[cpu]"             # only for automatic background removal
 ```
 
-Response:
-```json
-{
-  "status": "success",
-  "cutout_id": "cutout_abc123",
-  "message": "Cutout created successfully"
-}
-```
+## Full stack (needs a CUDA GPU)
 
-### 2. Generate Depth Map
+Adds the segmentation, depth, and neural relighting engines. On a CPU-only
+machine these load but fall back — SDXL-class relighting is not practical
+without a GPU.
 
-```bash
-curl -X POST http://localhost:8000/depth \
-  -F "file=@your_photo.png"
-```
-
-### 3. Relight Your Cutout
-
-```bash
-curl -X POST http://localhost:8000/relight \
-  -F "file=@cutout.png" \
-  -F "light_direction=side" \
-  -F "light_intensity=1.5"
-```
-
-### 4. Composite into Scene
-
-```bash
-curl -X POST http://localhost:8000/composite \
-  -F "background=@scene.png" \
-  -F 'cutout_ids=["cutout_abc123"]' \
-  -F 'positions=[[50,50]]' \
-  -F "color_grade=cinematic"
-```
-
-### 5. Full Pipeline (One Call)
-
-```bash
-curl -X POST http://localhost:8000/pipeline \
-  -F "image=@subject.png" \
-  -F "background=@scene.png" \
-  -F "light_direction=front" \
-  -F "color_grade=warm"
-```
-
-## Available Models
-
-### Segmentation
-- `rembg` - Fast, general purpose (default)
-- `birefnet` - Detailed boundaries
-- `sam2` - Interactive, zero-shot
-
-### Depth Estimation
-- `depth_anything_v2` - Balanced quality/speed (default)
-- `zoedepth` - Fine details
-- `marigold` - Physics-aware
-
-### Relighting
-- `sdxl` - Versatile, high quality (default)
-- `ic_light` - Specialized lighting control
-- `sdxl_turbo` - Faster alternative
-- `flux_dev` - Most advanced
-
-### Light Directions
-- `front` - Direct front lighting
-- `side` - Dramatic side lighting
-- `back` - Backlit/rim lighting
-- `rim` - Edge lighting
-- `fill` - Soft fill light
-- `top` - Overhead lighting
-- `bottom` - Underlighting
-
-### Color Grades
-- `neutral` - No grading
-- `warm` - Warm tones (+yellow/red)
-- `cool` - Cool tones (+blue)
-- `vintage` - Retro feel
-- `cinematic` - Film-like
-- `high_contrast` - Punchy contrast
-
-## Python Example
-
-```python
-import requests
-from PIL import Image
-
-# Cutout
-with open("photo.png", "rb") as f:
-    r = requests.post(
-        "http://localhost:8000/cutout",
-        files={"file": f},
-        data={"model": "rembg"}
-    )
-    cutout_id = r.json()["cutout_id"]
-    print(f"Created cutout: {cutout_id}")
-
-# Relight
-with open("photo.png", "rb") as f:
-    r = requests.post(
-        "http://localhost:8000/relight",
-        files={"file": f},
-        data={
-            "light_direction": "side",
-            "light_intensity": 1.2,
-            "model": "sdxl"
-        }
-    )
-    output_path = r.json()["file_path"]
-    print(f"Relit image saved to: {output_path}")
-
-# Full pipeline
-with open("subject.png", "rb") as img, open("background.png", "rb") as bg:
-    r = requests.post(
-        "http://localhost:8000/pipeline",
-        files={"image": img, "background": bg},
-        data={
-            "light_direction": "front",
-            "color_grade": "cinematic",
-            "segmentation_model": "rembg",
-            "depth_model": "depth_anything_v2",
-            "relighting_model": "sdxl"
-        }
-    )
-    result = r.json()
-    print(f"Final composite: {result['file_path']}")
-```
-
-## Working with Your Library
-
-```bash
-# List all cutouts
-curl http://localhost:8000/cutouts
-
-# Download specific cutout
-curl http://localhost:8000/cutout/{cutout_id} > my_cutout.png
-
-# Delete cutout
-curl -X DELETE http://localhost:8000/cutout/{cutout_id}
-
-# List all outputs
-curl http://localhost:8000/outputs
-
-# Storage stats
-curl http://localhost:8000/stats
-
-# Workflow history
-curl http://localhost:8000/history
-```
-
-## Frontend Integration
-
-The backend API is designed to work with the browser frontend. The frontend sends images to these endpoints and displays results.
-
-Example from JavaScript:
-```javascript
-// Cutout endpoint
-const formData = new FormData();
-formData.append('file', imageFile);
-formData.append('model', 'rembg');
-
-fetch('http://localhost:8000/cutout', {
-  method: 'POST',
-  body: formData
-})
-.then(r => r.json())
-.then(data => {
-  console.log('Cutout ID:', data.cutout_id);
-  // Use cutout_id in further workflows
-});
-```
-
-## Troubleshooting
-
-### ModuleNotFoundError
-Make sure all dependencies are installed:
 ```bash
 pip install -r backend/requirements.txt
 ```
 
-### CUDA Out of Memory
-Reduce image size or use smaller models:
+---
+
+# The desktop studio
+
 ```bash
-# Use turbo versions
--F "model=sdxl_turbo"
+python -m backend.ui.studio [image.png]
 ```
 
-### Slow First Load
-Models are downloaded and cached on first use. Subsequent calls are faster.
+Left pane is your image with the selection tinted over it, right pane is the
+finished asset with its edge material.
 
-### Port Already in Use
-Change port in backend/config/settings.py:
+| Action | How |
+|---|---|
+| Select | Drag on the left pane |
+| Deselect | Right-drag, or Alt+drag |
+| Switch tool | Brush / Control point radio buttons |
+| Clean up edges | **Refine edges (GrabCut)** after a rough selection |
+| Undo / redo | Ctrl+Z / Ctrl+Shift+Z |
+| Export | **Export asset PNG**, or **Export subject + mask** for the pair |
+
+**Edge snapping** makes the brush respect boundaries — it attenuates the stroke
+where colour departs from the pixel under your cursor and where the gradient is
+strong. Raise *sensitivity* to cling more tightly to one colour; drop *snapping*
+to 0 for a plain manual brush.
+
+**Control point** grows a selection from a click over similar colours, weighted
+by distance, in the manner of Snapseed.
+
+---
+
+# Command line
+
+```bash
+# Edge materials — one style, or all of them at once
+python -m backend.cli fx cutout.png out.png  --style torn_paper --width 30
+python -m backend.cli fx cutout.png out_dir/ --style all
+
+# Background removal, optionally with an edge material in the same pass
+python -m backend.cli cutout photo.jpg asset.png --style burnt
+
+# Scatter cutouts onto a large canvas
+python -m backend.cli collage cutouts/ collage.png --count 40 --width 6000 --height 6000
+
+# ...or write it as tiles, for canvases too big to hold in memory
+python -m backend.cli collage cutouts/ tiles/ --width 30000 --height 30000 --tiles
+
+# Cut a wide master video into Instagram carousel panels
+python -m backend.cli slice master.mp4 panels/ --slides 4
+```
+
+## Edge materials
+
+| Style | What it does |
+|---|---|
+| `torn_paper` | Jagged fibrous tear with an exposed white cardstock core |
+| `tissue` | Thin crinkled material, feathered with capped opacity |
+| `flesh` | Irregular liquid split with a red subdermal tint |
+| `sticker` | Die-cut white bleed plus a soft contact shadow |
+| `burnt` | Noise-eroded border ramping through ash to charcoal |
+
+`--width` sets the edge size in pixels, `--intensity` (0.0–2.0) how pronounced
+it is, `--seed` fixes the noise so a render repeats exactly.
+
+---
+
+# Python API
+
 ```python
-PORT = 8001  # Change from default 8000
+from PIL import Image
+from backend.pipeline import SelectionEngine, EdgeFXEngine, TiledCanvas
+
+# Select
+sel = SelectionEngine(Image.open("photo.jpg"))
+sel.control_point(400, 300, radius=350, tolerance=30)
+sel.refine_grabcut()
+cutout = sel.cutout()
+
+# Apply an edge material
+piece = EdgeFXEngine().apply(cutout, style="torn_paper", width=28, seed=1)
+
+# Compose on an unbounded canvas
+canvas = TiledCanvas(background=(1, 1, 1, 1))
+canvas.add_layer(piece, position=(1200, 800), scale=0.6, rotation=-12)
+canvas.add_layer(piece, position=(2400, 1500), scale=0.4, blend_mode="multiply")
+canvas.flatten((0, 0, 4000, 4000)).save("collage.png")
 ```
 
-## Next Steps
+## Working at large canvas sizes
 
-1. Read [ARCHITECTURE.md](ARCHITECTURE.md) for deep dive
-2. Explore API docs at `http://localhost:8000/docs`
-3. Build custom workflows combining endpoints
-4. Integrate with your own frontend or application
+The canvas is a coordinate space, not a buffer — layers hold a transform and are
+only rasterised for the region you ask for. Tiled output is bit-identical to a
+whole-canvas render, so tiling costs nothing in quality.
+
+```python
+canvas.estimate_flatten_bytes(box)      # check before you commit
+canvas.render_region((0, 0, 512, 512))  # just one region
+canvas.render_preview(max_dimension=1600)  # whole doc, downscaled cheaply
+canvas.export_tiles("tiles/")           # arbitrarily large, one tile of memory
+```
+
+`flatten()` refuses anything over ~1.5 GB of output rather than getting
+OOM-killed. Past that, use `export_tiles()` or render sub-regions.
+
+**On detail:** the canvas can be enormous, but cutouts are raster — a subject
+photographed at 2000px carries 2000px of detail wherever you place it. Scaling
+past native resolution interpolates rather than inventing detail.
+
+---
+
+# HTTP API
+
+```bash
+python backend/main.py     # http://localhost:8000, docs at /docs
+```
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /edge-fx` | Apply an edge material (CPU-only) |
+| `POST /cutout` | Background removal |
+| `POST /composite` | Composite cutouts into a scene |
+| `POST /carousel/slice` | Split a master video into carousel panels |
+| `POST /carousel/parse-srt` | Parse subtitles into timed lyric frames |
+| `POST /pipeline` | Full chain (needs GPU for the relight stage) |
+
+---
+
+# Troubleshooting
+
+**`ModuleNotFoundError: torch`** — you are calling a GPU engine. The selection,
+edge-FX, tiling, and video modules do not need it; install
+`requirements-cpu.txt` and use those.
+
+**Studio will not start** — `pip install PyQt6`. On bare Linux you may also need
+`libegl1` and `libgl1`.
+
+**Relighting is extremely slow** — expected without a CUDA GPU. SDXL on CPU runs
+in minutes per image.
+
+**Large flatten raises MemoryError** — that is the guard doing its job. Use
+`export_tiles()` or a smaller region.
