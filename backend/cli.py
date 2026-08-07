@@ -115,6 +115,38 @@ def cmd_collage(args) -> int:
     return 0
 
 
+def cmd_relight(args) -> int:
+    """Relight a cutout on a remote GPU Space, falling back to a local adjustment."""
+    from backend.services.remote_relight import relight_or_local
+
+    cutout = Image.open(args.input).convert("RGBA")
+    relit, backend = relight_or_local(
+        cutout,
+        space_id=args.space,
+        direction=args.direction,
+        intensity=args.intensity,
+        prompt=args.prompt,
+        steps=args.steps,
+        seed=args.seed,
+    )
+
+    if backend == "local" and args.require_remote:
+        logger.error("remote relight unavailable and --require-remote was set")
+        return 1
+
+    out = Path(args.output)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    relit.save(out)
+
+    if backend == "local":
+        logger.warning(
+            "used the LOCAL fallback (brightness/contrast only, not a neural relight). "
+            "Pass --space <user>/<space> or set RELIGHT_SPACE for real relighting."
+        )
+    logger.info("wrote %s via %s backend", out, backend)
+    return 0
+
+
 def cmd_slice(args) -> int:
     from backend.pipeline.video_engine import VideoCarouselEngine
 
@@ -169,6 +201,21 @@ def build_parser() -> argparse.ArgumentParser:
     co.add_argument("--opaque", action="store_true", help="white background instead of transparent")
     co.add_argument("--seed", type=int, default=None)
     co.set_defaults(func=cmd_collage)
+
+    rl = sub.add_parser("relight", help="relight a cutout on a remote GPU Space")
+    rl.add_argument("input")
+    rl.add_argument("output")
+    rl.add_argument("--space", default=None,
+                    help="Space id like user/relight-endpoint (or set RELIGHT_SPACE)")
+    rl.add_argument("--direction", default="front",
+                    choices=["front", "side", "back", "rim", "fill", "top", "bottom"])
+    rl.add_argument("--intensity", type=float, default=1.0, help="0.5-2.0")
+    rl.add_argument("--prompt", default="", help="extra prompt, e.g. 'golden hour'")
+    rl.add_argument("--steps", type=int, default=24)
+    rl.add_argument("--seed", type=int, default=0, help="0 = random")
+    rl.add_argument("--require-remote", action="store_true",
+                    help="fail instead of silently using the local fallback")
+    rl.set_defaults(func=cmd_relight)
 
     sl = sub.add_parser("slice", help="cut a wide master video into carousel panels")
     sl.add_argument("input")
