@@ -3535,6 +3535,93 @@ function paintAt(L, from, to) {
   L._cache = null;
 }
 
+/* ---------------------------------------------------------------------------
+   Undo for painting.
+
+   Every mask in the app was permanent the moment you touched it, and the only
+   way out of a bad stroke was to clear the whole map and start again. That is
+   what actually blocks iterating on a scene: not the absence of controls but
+   the cost of trying one, because a brush you cannot take back is a brush you
+   use timidly.
+
+   A stroke is the unit, not a pixel and not a session. The target mask is
+   copied when the pointer goes down and the copy is banked when it comes up,
+   so one gesture is one step however many stamps it laid down. Undo and redo
+   are the same operation — swap the live mask for the stored one and keep
+   what was there — which is why redo needs no separate bookkeeping.
+--------------------------------------------------------------------------- */
+const UNDO_MAX = 24;
+const undoStack = [], redoStack = [];
+
+function cloneCv(c) {
+  if (!c) return null;
+  const d = cvOf(c.width, c.height);
+  d.getContext("2d").drawImage(c, 0, 0);
+  return d;
+}
+function liveMaskOf(kind, layer) {
+  const S = state.scene;
+  if (kind === "sky") return S.skyEdit;
+  if (kind === "blocker") return S.occluder;
+  if (kind === "depth") return S.depthMap;
+  if (kind === "light") return S.lightPaint;
+  if (kind === "open") return S.openPaint;
+  if (kind === "subject") return layer ? layer.mask : null;
+  return null;
+}
+function setMaskOf(kind, layer, cv) {
+  const S = state.scene;
+  if (kind === "sky") { S.skyEdit = cv; skyEditDirty(); return; }
+  if (kind === "blocker") { S.occluder = cv; scheduleRender(); return; }
+  if (kind === "depth") { S.depthMap = cv; scheduleRender(); return; }
+  if (kind === "light") { S.lightPaint = cv; scheduleRender(); return; }
+  // the openness solve is cached, and a painted correction has to invalidate it
+  if (kind === "open") { S.openPaint = cv; S._openCache = null; scheduleRender(); return; }
+  if (kind === "subject" && layer) {
+    layer.mask = cv; layer.maskRev++; layer._cache = null; scheduleRender();
+  }
+}
+function snapshotMask(t) {
+  if (!t) return null;
+  if (t.kind === "window") return { kind: "window", list: state.scene.windows.list.map((w) => ({ ...w })) };
+  const live = liveMaskOf(t.kind, t.layer);
+  if (!live) return null;
+  return { kind: t.kind, layer: t.layer || null, cv: cloneCv(live) };
+}
+/* Returns the state it replaced, which is exactly the entry the opposite
+   stack needs — so undo and redo are one function used in both directions. */
+function swapSnapshot(s) {
+  if (!s) return null;
+  if (s.kind === "window") {
+    const cur = { kind: "window", list: state.scene.windows.list.map((w) => ({ ...w })) };
+    state.scene.windows.list = s.list.map((w) => ({ ...w }));
+    scheduleRender(); refreshStack();
+    return cur;
+  }
+  const cur = { kind: s.kind, layer: s.layer, cv: cloneCv(liveMaskOf(s.kind, s.layer)) };
+  setMaskOf(s.kind, s.layer, cloneCv(s.cv));
+  return cur;
+}
+function pushUndo(s) {
+  if (!s) return;
+  undoStack.push(s);
+  if (undoStack.length > UNDO_MAX) undoStack.shift();
+  redoStack.length = 0;
+  buildBrushBar();
+}
+function undoPaint() {
+  if (!undoStack.length) { toast("Nothing to undo"); return; }
+  const inv = swapSnapshot(undoStack.pop());
+  if (inv) redoStack.push(inv);
+  buildBrushBar();
+}
+function redoPaint() {
+  if (!redoStack.length) { toast("Nothing to redo"); return; }
+  const inv = swapSnapshot(redoStack.pop());
+  if (inv) undoStack.push(inv);
+  buildBrushBar();
+}
+
 let painting = null;
 function startPaint(e) {
   const t = maskTarget();
@@ -3546,7 +3633,7 @@ function startPaint(e) {
   e.preventDefault();
   e.stopPropagation();
   const p = targetPoint(t, e.clientX, e.clientY);
-  painting = { t, last: p, startX: e.clientX, startY: e.clientY, moved: false, tool: state.brush.tool };
+  painting = { t, last: p, startX: e.clientX, startY: e.clientY, moved: false, tool: state.brush.tool, snap: snapshotMask(t) };
   if (!isWand(painting.tool)) {
     if (t.kind === "window") { /* windows are placed on release, not dragged */ }
     else if (t.kind === "sky") paintSky(p, p);
@@ -3576,11 +3663,17 @@ function endPaint(e) {
   painting = null;
   window.removeEventListener("pointermove", movePaint);
   window.removeEventListener("pointerup", endPaint);
-  if (p && isWand(p.tool) && !p.moved) {
+  if (!p) return;
+  const wandFired = isWand(p.tool) && !p.moved;
+  // A drag that laid down stamps changed something; a wand only changed
+  // something if it actually fired. A wand dragged off target changed nothing,
+  // and banking that would cost the user an undo press to go nowhere.
+  if (p.snap && (wandFired || (p.moved && !isWand(p.tool)))) pushUndo(p.snap);
+  if (wandFired) {
     const add = p.tool === "wandAdd";
     if (p.t.kind === "window") tapWindow(p.last, add);
     else if (p.t.kind === "sky") wandSky(p.last, add);
-    else if (p.t.kind === "blocker" || p.t.kind === "depth") wandFlat(p.t, p.last, add);
+    else if (p.t.kind === "blocker" || p.t.kind === "depth" || p.t.kind === "light" || p.t.kind === "open") wandFlat(p.t, p.last, add);
     else wandSubject(p.t.layer, p.last, add);
     buildBrushBar();
   }
@@ -4311,6 +4404,21 @@ function buildBrushBar() {
   const L = state.scene.layers.find((x) => x.id === state.scene.selectedId);
   bar.innerHTML = "";
 
+  // Undo / redo first, because they are what makes the rest safe to try.
+  const hist = document.createElement("div");
+  hist.className = "brush-tools";
+  [["↶", undoPaint, undoStack.length, `Undo (${undoStack.length})`],
+   ["↷", redoPaint, redoStack.length, `Redo (${redoStack.length})`]].forEach(([glyph, fn, n, title]) => {
+    const b = document.createElement("button");
+    b.className = "brush-btn";
+    b.textContent = glyph;
+    b.title = title + " · Ctrl+Z / Ctrl+Shift+Z";
+    b.disabled = !n;
+    b.addEventListener("click", fn);
+    hist.appendChild(b);
+  });
+  bar.appendChild(hist);
+
   // What am I masking?
   const tgt = document.createElement("div");
   tgt.className = "brush-tools";
@@ -4598,6 +4706,17 @@ async function init() {
     toast("Light placed — drag it on the image.");
   });
   dom.layerOverlay.addEventListener("pointerdown", (e) => { if (state.brush.on) startPaint(e); });
+  /* Ctrl/Cmd+Z anywhere while the brush is live. Guarded on the brush being
+     on so it cannot swallow the shortcut from a text field elsewhere. */
+  window.addEventListener("keydown", (e) => {
+    if (!(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== "z") return;
+    if (!state.brush.on) return;
+    const tag = (e.target && e.target.tagName) || "";
+    if (tag === "INPUT" || tag === "TEXTAREA") return;
+    e.preventDefault();
+    if (e.shiftKey) redoPaint(); else undoPaint();
+  });
+
   dom.copyPromptBtn.addEventListener("click", async () => {
     const ok = await copyText(RELIGHT_PROMPT);
     toast(ok ? "Relight prompt copied — paste it in the Gemini app with your image." : "Couldn't copy automatically.");
