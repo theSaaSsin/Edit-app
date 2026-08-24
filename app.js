@@ -151,7 +151,7 @@ const state = {
     selectedId: null, zTop: 1, look: null,
     refine: { reach: 45, strength: 80, spill: 80 },
   },
-  brush: { on: false, target: "subject", tool: "add", size: 12, soft: 60, strength: 70, showMask: true },
+  brush: { on: false, target: "subject", tool: "add", size: 12, soft: 60, strength: 70, showMask: true, tone: "off", toneDepth: 2 },
 };
 let idSeq = 0;
 const uid = (p) => `${p}_${Date.now().toString(36)}_${idSeq++}`;
@@ -3760,6 +3760,100 @@ function paintAt(L, from, to) {
    are the same operation — swap the live mask for the stored one and keep
    what was there — which is why redo needs no separate bookkeeping.
 --------------------------------------------------------------------------- */
+/* ---------------------------------------------------------------------------
+   Luminosity masks.
+
+   The retoucher's targeting technique, and the reason their dodging looks
+   like light rather than like paint. A selection is built from the picture's
+   own luminance, so it already follows every edge in the frame exactly, and
+   it is narrowed by INTERSECTING it with itself rather than by moving a
+   threshold. That distinction is the whole trick: a threshold has an edge,
+   and an edge in a mask shows up as a contour in the result, whereas an
+   intersection just steepens a curve that was smooth to begin with and stays
+   smooth however far you push it.
+
+   Intersecting a mask with itself is multiplying it, so "Lights 2" is L², and
+   "Lights 3" is L³ — each one darker everywhere except where it was already
+   near white. Darks are the same on the inverse, and midtones on a triangle
+   that peaks at middle grey.
+
+   In Photoshop these are channels you load as a selection. Here they gate the
+   brush: pick a zone and every stroke lands only where those tones are, on
+   whatever you are painting. Brush across a face with Darks 2 and only the
+   shadow side takes it, with a falloff that came from the photograph.
+--------------------------------------------------------------------------- */
+const TONE_ZONES = {
+  off:    { name: "All tones", icon: "◐" },
+  lights: { name: "Lights",    icon: "◔" },
+  mids:   { name: "Midtones",  icon: "◑" },
+  darks:  { name: "Darks",     icon: "◕" },
+};
+
+function luminosityGate(srcCanvas, w, h, zone, depth) {
+  const c = cvOf(w, h);
+  const x = c.getContext("2d");
+  x.drawImage(srcCanvas, 0, 0, w, h);
+  const d = x.getImageData(0, 0, w, h).data;
+  const n = w * h;
+  const g = new Float32Array(n);
+  const dep = Math.max(1, Math.min(3, depth | 0));
+  for (let i = 0; i < n; i++) {
+    const L = (0.2126 * d[i * 4] + 0.7152 * d[i * 4 + 1] + 0.0722 * d[i * 4 + 2]) / 255;
+    let v;
+    if (zone === "lights") v = L;
+    else if (zone === "darks") v = 1 - L;
+    else v = 1 - Math.abs(2 * L - 1);      // midtones: a triangle peaking at 0.5
+    // self-intersection, which is multiplication — never a threshold
+    let m = v;
+    for (let k = 1; k < dep; k++) m *= v;
+    g[i] = m;
+  }
+  return g;
+}
+
+/* What the tones should be read from. For a subject mask that is the
+   subject's own photograph, which is what a retoucher means by masking hair
+   on its brightness; for anything in scene space it is the composite as it
+   currently stands, so the gate reflects the night solve and every light
+   rather than the untouched plate. */
+function toneSourceFor(t, w, h) {
+  if (t.kind === "subject") return t.src;
+  const full = renderComposite(Math.min(1400, Math.max(w, 320)));
+  return full || state.scene.base.img;
+}
+
+function buildToneGate(t) {
+  const B = state.brush;
+  if (!t || B.tone === "off") return null;
+  const cv = t.kind === "window" ? null : t.canvas;
+  if (!cv) return null;
+  try {
+    const srcCv = toneSourceFor(t, cv.width, cv.height);
+    if (!srcCv) return null;
+    return luminosityGate(srcCv, cv.width, cv.height, B.tone, B.toneDepth);
+  } catch (err) { console.error(err); return null; }
+}
+
+/* Applied after the painter has run, by blending the result back towards the
+   pre-stroke snapshot everywhere the gate is low. Doing it this way means no
+   painter needs to know the gate exists — erase, restore, fix-light, dodge,
+   burn and the flat maps all inherit it unchanged. */
+function applyToneGate(target, snapCv, gate) {
+  if (!target || !snapCv || !gate) return;
+  const w = target.width, h = target.height;
+  if (snapCv.width !== w || snapCv.height !== h) return;
+  const tx = target.getContext("2d");
+  const cur = tx.getImageData(0, 0, w, h);
+  const snp = snapCv.getContext("2d").getImageData(0, 0, w, h).data;
+  const cd = cur.data;
+  for (let i = 0; i < cd.length; i += 4) {
+    const g = gate[i >> 2];
+    if (g >= 0.999) continue;
+    for (let c = 0; c < 4; c++) cd[i + c] = snp[i + c] + (cd[i + c] - snp[i + c]) * g;
+  }
+  tx.putImageData(cur, 0, 0);
+}
+
 const UNDO_MAX = 24;
 const undoStack = [], redoStack = [];
 
@@ -3843,7 +3937,11 @@ function startPaint(e) {
   e.preventDefault();
   e.stopPropagation();
   const p = targetPoint(t, e.clientX, e.clientY);
-  painting = { t, last: p, startX: e.clientX, startY: e.clientY, moved: false, tool: state.brush.tool, snap: snapshotMask(t) };
+  const snap = snapshotMask(t);
+  // Built once per stroke, not per move: the tones to aim at are the ones
+  // that were there when the stroke began, and re-reading them mid-stroke
+  // would let the brush chase its own output.
+  painting = { t, last: p, startX: e.clientX, startY: e.clientY, moved: false, tool: state.brush.tool, snap, gate: buildToneGate(t) };
   if (!isWand(painting.tool)) {
     if (t.kind === "window") { /* windows are placed on release, not dragged */ }
     else if (t.kind === "sky") paintSky(p, p);
@@ -3865,6 +3963,11 @@ function movePaint(e) {
   if (painting.t.kind === "sky") paintSky(painting.last, p);
   else if (painting.t.kind === "blocker" || painting.t.kind === "depth" || painting.t.kind === "light" || painting.t.kind === "open") paintFlat(painting.t, painting.last, p);
   else paintAt(painting.t.layer, painting.last, p);
+  if (painting.gate && painting.snap && painting.snap.cv) {
+    applyToneGate(liveMaskOf(painting.t.kind, painting.t.layer), painting.snap.cv, painting.gate);
+    if (painting.t.kind === "sky") skyEditDirty();
+    else if (painting.t.kind === "open") state.scene._openCache = null;
+  }
   painting.last = p;
   scheduleRender();
 }
@@ -3885,6 +3988,12 @@ function endPaint(e) {
     else if (p.t.kind === "sky") wandSky(p.last, add);
     else if (p.t.kind === "blocker" || p.t.kind === "depth" || p.t.kind === "light" || p.t.kind === "open") wandFlat(p.t, p.last, add);
     else wandSubject(p.t.layer, p.last, add);
+    if (p.gate && p.snap && p.snap.cv) {
+      applyToneGate(liveMaskOf(p.t.kind, p.t.layer), p.snap.cv, p.gate);
+      if (p.t.kind === "sky") skyEditDirty();
+      else if (p.t.kind === "open") state.scene._openCache = null;
+      scheduleRender();
+    }
     buildBrushBar();
   }
 }
@@ -3896,6 +4005,12 @@ function setBrush(on, tool) {
   dom.sceneStage.classList.toggle("brush-mode", on);
   renderHandles();
   buildBrushBar();
+  /* Showing the brush bar takes ~220px off the stage, but the canvas is only
+     re-fitted when something renders — so the shrink was landing on the first
+     stroke instead of on the toggle, and the picture moved under the hand
+     drawing on it (423x634 down to 270x405, measured between two strokes).
+     Rendering here settles the layout while nothing is being drawn. */
+  scheduleRender();
   if (!on && state.brush._stackDirty) { state.brush._stackDirty = false; buildLayerStack(); }
 }
 
@@ -4644,9 +4759,14 @@ function buildBrushBar() {
   const L = state.scene.layers.find((x) => x.id === state.scene.selectedId);
   bar.innerHTML = "";
 
-  // Undo / redo first, because they are what makes the rest safe to try.
-  const hist = document.createElement("div");
-  hist.className = "brush-tools";
+  /* History and tonal range share one row, and the tone zones are icons
+     rather than words. Given a row of their own they wrapped the toolbar onto
+     another line, and since the stage is what gives up the space, the picture
+     shrank the moment you laid down a stroke — measured at 423x634 down to
+     251x376, which moves the canvas out from under the hand that is drawing
+     on it. Toolbar height is not a cosmetic concern here. */
+  const row = document.createElement("div");
+  row.className = "brush-tools";
   [["↶", undoPaint, undoStack.length, `Undo (${undoStack.length})`],
    ["↷", redoPaint, redoStack.length, `Redo (${redoStack.length})`]].forEach(([glyph, fn, n, title]) => {
     const b = document.createElement("button");
@@ -4655,9 +4775,32 @@ function buildBrushBar() {
     b.title = title + " · Ctrl+Z / Ctrl+Shift+Z";
     b.disabled = !n;
     b.addEventListener("click", fn);
-    hist.appendChild(b);
+    row.appendChild(b);
   });
-  bar.appendChild(hist);
+  const sep = document.createElement("span");
+  sep.className = "tool-sep";
+  row.appendChild(sep);
+  Object.entries(TONE_ZONES).forEach(([k, z]) => {
+    const b = document.createElement("button");
+    b.className = "brush-btn" + (B.tone === k ? " active" : "");
+    b.textContent = z.icon;
+    b.title = k === "off"
+      ? "All tones — paint everywhere the brush lands"
+      : `${z.name} only — where the picture's own ${z.name.toLowerCase()} are`;
+    b.addEventListener("click", () => { B.tone = k; buildBrushBar(); });
+    row.appendChild(b);
+  });
+  if (B.tone !== "off") {
+    [1, 2, 3].forEach((d) => {
+      const b = document.createElement("button");
+      b.className = "brush-btn" + (B.toneDepth === d ? " active" : "");
+      b.textContent = String(d);
+      b.title = `${TONE_ZONES[B.tone].name} ${d} — each step intersects the mask with itself again`;
+      b.addEventListener("click", () => { B.toneDepth = d; buildBrushBar(); });
+      row.appendChild(b);
+    });
+  }
+  bar.appendChild(row);
 
   // What am I masking?
   const tgt = document.createElement("div");
