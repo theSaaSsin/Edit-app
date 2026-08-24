@@ -138,6 +138,30 @@ Energy is **conserved by construction** — the extracted highlight term is subt
 
 > Both were wrong first, in the same instructive way: the obvious formulation of each is subtly non-conservative. Scaling bloom's loss by a constant made large bright regions *brighten* (p99 climbed to 162.5). `A × (1 − blur(A))` for the wrap band only vanishes where the blur saturates, so a subject narrower than the radius got lit all over — an 11% lift in its deep interior.
 
+### Luminosity masks
+
+The retoucher's targeting technique, and the reason their dodging reads as *light* rather than as paint. A selection built from the image's own luminance already follows every edge in the frame exactly — and it's narrowed by **intersecting it with itself**, never by moving a threshold.
+
+That distinction is the whole trick. A threshold has an edge, and an edge in a mask becomes a contour in the result. An intersection only steepens a curve that was already smooth, and stays smooth however far you push it. Intersecting a mask with itself is multiplying it:
+
+| Zone | Depth 1 | Depth 2 | Depth 3 |
+| --- | --- | --- | --- |
+| **◔ Lights** | L | L² | L³ |
+| **◕ Darks** | 1−L | (1−L)² | (1−L)³ |
+| **◑ Midtones** | 1−&#124;2L−1&#124; | …² | …³ |
+
+In Photoshop these are channels you load as a selection. Here they **gate the brush**, which is the more useful form: pick a zone and every stroke lands only where those tones are, on whatever you're painting. Brush across a face with *Darks 2* and only the shadow side takes it, with a falloff that came out of the photograph.
+
+It works by blending the painted result back toward the pre-stroke snapshot wherever the gate is low — so **no tool needs to know the gate exists**. Erase, restore, fix-light, dodge, burn, the flat maps and the wands all inherit it unchanged. The gate is built once when the stroke starts, so the brush aims at the tones that were there when it began rather than chasing its own output. Tones are read from the subject's own photo for a subject mask, and from the current composite for anything in scene space — so the gate sees the night solve and the lights.
+
+Verified against the mathematics: *Lights 2* at 64 is 0.0630 against (64/255)² = 0.0630; *Lights 3* is 0.0158 against 0.0158; midtones peak 0.996 at middle grey and reach 0 at both ends. The largest step between adjacent 8-bit levels is **0.0156** across every zone and depth, so there is no contour anywhere. On a broad stroke over a mixed facade the Lights gate moves highlights **100×** more than shadows; Darks moves shadows **18×** more than highlights.
+
+## Undo
+
+Every mask is undoable, 24 steps, `Ctrl`/`Cmd`+`Z` and `Ctrl`/`Cmd`+`Shift`+`Z` while the brush is live. **The stroke is the unit** — one gesture is one step however many stamps it laid down. Undo and redo are the same operation (swap the live mask for the stored one, keep what was there), so the two stacks can't drift apart.
+
+This is what makes the rest safe to use. A brush you can't take back is a brush you use timidly.
+
 ## Real night
 
 🌙 **Night** converts a daytime photograph to night rather than dropping a blue grade over it — the sky has to actually become sky at night.
