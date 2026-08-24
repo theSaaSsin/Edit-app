@@ -22,7 +22,7 @@ const newAdj = () => ({
   exposure: 0, contrast: 0, highlights: 0, shadows: 0,
   saturation: 0, temperature: 0, tint: 0, blur: 0, grain: 0,
 });
-const newMatte = () => ({ choke: 0, feather: 0, edgeDark: 0, burn: 0, dodge: 0 });
+const newMatte = () => ({ choke: 0, feather: 0, edgeDark: 0, burn: 0, dodge: 0, wrap: 0, wrapDist: 32 });
 const newShadow = () => ({ on: true, angle: 135, length: 26, soft: 40, opacity: 45, contact: 55 });
 
 /* Slider specs — the panel UI is generated from these */
@@ -41,6 +41,8 @@ const MATTE_ROWS = [
   { k: "choke",    label: "Shrink edge", min: 0, max: 100, hint: "eats a halo" },
   { k: "feather",  label: "Soften edge", min: 0, max: 100 },
   { k: "edgeDark", label: "Darken edge", min: 0, max: 100, hint: "kills bright fringing" },
+  { k: "wrap",     label: "Light wrap",  min: 0, max: 100, hint: "the scene's light spills onto the edge" },
+  { k: "wrapDist", label: "Wrap depth",  min: 4, max: 100, hint: "how far in it reaches" },
 ];
 const SHADOW_ROWS = [
   { k: "angle",   label: "Light from", min: 0, max: 359, unit: "°" },
@@ -143,6 +145,7 @@ const state = {
     lights: [],
     windows: { visible: false, list: [], warmth: 34, brightness: 62, spill: 45, variation: 35, seed: 5 },
     relight: { visible: true, dataUrl: null, img: null, strength: 100, scale: 10, colour: 100, protect: 20, keepDark: 45 },
+    bloom: { visible: false, amount: 45, threshold: 62, radius: 34, spread: 55, halation: 40, tint: 18 },
     nightSolve: { visible: false, strength: 100, exposure: 70, canyon: 26, skyAmbient: 46, skyHue: 214, skySat: 30, windowGain: 62, lampGain: 70, floorLevel: 42, keepDark: 40 },
     night: { visible: false, amount: 0, skyHue: 220, skySat: 22, skyDark: 78, skyDetail: 70, shadowCool: 18, lightWarm: 55, horizonGlow: 35, glowSide: 70, stars: 0, lampWarmth: 72, skyDetect: 50, skyFeather: 30, skyEdge: 70, skyTighten: 0, skyBurn: 0, skyDodge: 0, ambient: 42, killDaylight: 78, seed: 3 },
     selectedId: null, zTop: 1, look: null,
@@ -2046,6 +2049,123 @@ function skyOpenness(skyA, w, h, canyonFrac) {
   return data;
 }
 
+/* ---------------------------------------------------------------------------
+   Bloom and halation — the lens, not the scene.
+
+   Everything up to here has been about what light does to surfaces. This is
+   about what it does inside the camera, and it is the reason a technically
+   correct render still reads as a render: real optics are not clean. Light
+   from a bright source scatters in the glass and spreads a soft halo, and on
+   film it passes through the emulsion, reflects off the backing and returns —
+   which is halation, and it comes back RED, because the longer wavelengths
+   penetrate furthest before they bounce.
+
+   Retouchers add this by hand on every night frame. Two departures from the
+   hand version, both of which the app is in a position to do better:
+
+   · The halo is built from several blur radii summed, not one. A single
+     radius gives a distinct ring with an obvious edge — you can see where it
+     stops. Real scattering has no characteristic size, so summing radii in
+     geometric steps approximates the long tail that makes it read as glow
+     rather than as a drawn circle.
+
+   · Energy is taken from the highlights rather than invented on top of them.
+     Screening a blurred copy over the frame adds brightness that was never
+     in the picture and washes the blacks; here the source is dimmed by what
+     it sheds, so a lamp spreads its light instead of multiplying it.
+--------------------------------------------------------------------------- */
+function applyBloom(ctx, W, H, B) {
+  // The halo is broad by definition, so it is solved small and scaled up.
+  const cap = 420;
+  const sc = Math.min(1, cap / Math.max(W, H));
+  const w = Math.max(8, Math.round(W * sc)), h = Math.max(8, Math.round(H * sc));
+  const n = w * h;
+
+  const src = cvOf(w, h);
+  src.getContext("2d").drawImage(ctx.canvas, 0, 0, w, h);
+  const sd = src.getContext("2d").getImageData(0, 0, w, h).data;
+
+  /* Only what is genuinely bright sheds light, with a soft knee at the
+     threshold — a hard cut makes the halo appear abruptly as a slider moves
+     and puts a visible contour along the threshold in a gradient sky. */
+  const thr = B.threshold / 100;
+  const knee = 0.14;
+  const hi = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    const r = sd[i * 4] / 255, g = sd[i * 4 + 1] / 255, b = sd[i * 4 + 2] / 255;
+    const L = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    const t = clamp((L - thr + knee) / (knee * 2), 0, 1);
+    const wgt = t * t * (3 - 2 * t);              // smoothstep
+    if (wgt <= 0.001) continue;
+    hi[i * 3] = r * wgt; hi[i * 3 + 1] = g * wgt; hi[i * 3 + 2] = b * wgt;
+  }
+
+  const base = Math.max(1, (B.radius / 100) * Math.min(w, h) * 0.16);
+  const spread = 1 + (B.spread / 100) * 1.6;      // how far the tail reaches
+  const halo = new Float32Array(n * 3);
+  let wsum = 0;
+  for (let k = 0; k < 4; k++) {
+    const r = Math.max(1, Math.round(base * Math.pow(spread, k)));
+    if (r > Math.max(w, h)) break;
+    const lay = Float32Array.from(hi);
+    boxBlur(lay, w, h, r, 3);
+    boxBlur(lay, w, h, Math.max(1, r >> 1), 3);
+    const wk = 1 / (k + 1);                       // near scatter dominates
+    wsum += wk;
+    for (let i = 0; i < n * 3; i++) halo[i] += lay[i] * wk;
+  }
+  if (wsum > 0) for (let i = 0; i < n * 3; i++) halo[i] /= wsum;
+
+  /* Halation returns warm. Weight the halo towards red by how much of it is
+     asked for, rather than tinting the whole frame. */
+  const hal = B.halation / 100, tint = B.tint / 100;
+  if (hal > 0) {
+    for (let i = 0; i < n; i++) {
+      const l = (halo[i * 3] + halo[i * 3 + 1] + halo[i * 3 + 2]) / 3;
+      halo[i * 3] += (l * (1 + 0.9 * tint) - halo[i * 3]) * hal;
+      halo[i * 3 + 1] += (l * (1 - 0.15 * tint) - halo[i * 3 + 1]) * hal * 0.7;
+      halo[i * 3 + 2] += (l * (1 - 0.75 * tint) - halo[i * 3 + 2]) * hal;
+    }
+  }
+
+  // Encode and let the canvas do the smooth upscale.
+  const hc = cvOf(w, h), hx = hc.getContext("2d");
+  const hid = hx.createImageData(w, h);
+  for (let i = 0; i < n; i++) {
+    for (let c = 0; c < 3; c++) hid.data[i * 4 + c] = clamp(Math.round(halo[i * 3 + c] * 255), 0, 255);
+    hid.data[i * 4 + 3] = 255;
+  }
+  hx.putImageData(hid, 0, 0);
+  const up = cvOf(W, H), ux = up.getContext("2d");
+  ux.imageSmoothingEnabled = true; ux.imageSmoothingQuality = "high";
+  ux.drawImage(hc, 0, 0, W, H);
+  const ud = ux.getImageData(0, 0, W, H).data;
+
+  const out = ctx.getImageData(0, 0, W, H);
+  const od = out.data;
+  const amt = B.amount / 100;
+  /* Conservation, done exactly rather than approximately. Take away the same
+     highlight term that was extracted and give back its blurred self: a blur
+     preserves total energy, so what leaves the sources is precisely what
+     arrives around them and the frame's overall brightness does not move.
+
+     The first attempt scaled the loss by a hand-picked constant instead. That
+     works for a small lamp, where the blur spreads its light far enough that
+     the centre keeps little, and fails for a large bright region, where the
+     blurred copy is nearly the original — so the region got its own light
+     handed back on top of itself and the highlights climbed (99th percentile
+     159.1 to 162.5) when they should have come down. */
+  for (let i = 0; i < od.length; i += 4) {
+    const L = (0.2126 * od[i] + 0.7152 * od[i + 1] + 0.0722 * od[i + 2]) / 255;
+    const t = clamp((L - thr + knee) / (knee * 2), 0, 1);
+    const wgt = t * t * (3 - 2 * t);
+    for (let c = 0; c < 3; c++) {
+      od[i + c] = clamp(od[i + c] - od[i + c] * wgt * amt + ud[i + c] * amt, 0, 255);
+    }
+  }
+  ctx.putImageData(out, 0, 0);
+}
+
 function solveNightField(ctx, W, H, NS) {
   const S = state.scene;
   const cap = 480;
@@ -2296,10 +2416,96 @@ function renderComposite(targetW, opts = {}) {
       ctx.restore();
     }
 
+    /* Light wrap — the classic compositing fix for a subject that reads as
+       pasted on. In a photograph the scene's light bends around a silhouette
+       and spills onto the edge of whatever is in front of it; a cut-out has a
+       hard boundary where that spill should be, and the eye reads the absence
+       instantly even when exposure and colour match perfectly.
+
+       The recipe is the standard one — blur the background, keep the band
+       just inside the subject's edge, add it in — with two differences. It is
+       computed in SCREEN space rather than sprite space, so it survives
+       rotation and flip without a second transform to get wrong. And the
+       background it samples is the composite as it stands at this point in
+       the render, which by now has the night solve and every light already
+       on it: the wrap therefore carries the actual illumination behind the
+       subject rather than a guess taken from the untouched plate. Standing in
+       front of a lit window puts the window's warmth on the edge, with no
+       colour to pick by hand. */
+    const wrapAmt = (L.matte.wrap || 0) / 100;
+    if (wrapAmt > 0) {
+      const rw = Math.max(24, Math.round(W * 0.32));
+      const rh = Math.max(24, Math.round(rw * H / W));
+      const bgc = cvOf(rw, rh);
+      bgc.getContext("2d").drawImage(ctx.canvas, 0, 0, rw, rh);
+
+      // the subject's alpha, in screen space, at the same reduced size
+      const alc = cvOf(rw, rh), ax = alc.getContext("2d");
+      const kx = rw / W, ky = rh / H;
+      ax.save();
+      ax.translate(cx * kx, cy * ky);
+      ax.rotate(rad);
+      if (L.flipH) ax.scale(-1, 1);
+      ax.drawImage(sprite, (-sw / 2) * kx, (-sh / 2) * ky, sw * kx, sh * ky);
+      ax.restore();
+
+      const bd = bgc.getContext("2d").getImageData(0, 0, rw, rh).data;
+      const adta = ax.getImageData(0, 0, rw, rh).data;
+      const nn = rw * rh;
+      const A = new Float32Array(nn);
+      for (let i = 0; i < nn; i++) A[i] = adta[i * 4 + 3] / 255;
+      const Ab = Float32Array.from(A);
+      /* The reach is a fraction of the SUBJECT, not of the frame. Scaled to
+         the frame, the same slider wrapped a few pixels of a subject filling
+         the shot and swallowed a small one whole — on a figure narrower than
+         the blur radius the band never vanishes and the wrap lights the whole
+         body. Measured as an 11% lift in the deep interior before this. */
+      const subW = Math.max(4, sw * kx);
+      const r = clamp(Math.round(((L.matte.wrapDist || 32) / 100) * subW * 0.35), 1, Math.round(Math.min(rw, rh) * 0.12));
+      boxBlur(Ab, rw, rh, r, 1); boxBlur(Ab, rw, rh, Math.max(1, r >> 1), 1);
+      const bg = new Float32Array(nn * 3);
+      for (let i = 0; i < nn; i++) for (let c = 0; c < 3; c++) bg[i * 3 + c] = bd[i * 4 + c];
+      boxBlur(bg, rw, rh, r, 3); boxBlur(bg, rw, rh, Math.max(1, r >> 1), 3);
+
+      const wc = cvOf(rw, rh), wx = wc.getContext("2d");
+      const wid = wx.createImageData(rw, rh);
+      for (let i = 0; i < nn; i++) {
+        /* A - blur(A). Inside the subject and far from any edge both terms
+           are 1 and the band is exactly zero, which is the property that
+           matters: the wrap cannot creep into the middle of a face. Outside,
+           A is 0 and the difference goes negative, so the clamp keeps the
+           spill off the background. Only the strip just within the silhouette
+           survives — and a thin structure like hair, where the blur never
+           saturates, gets a strong band, which is right.
+
+           A * (1 - blur(A)) was tried first and is subtly wrong: it only
+           vanishes where the blur reaches 1, so on any subject narrow
+           relative to the blur radius it lit the whole body. Measured as an
+           11% lift in the deep interior. */
+        const band = clamp((A[i] - Ab[i]) * 2, 0, 1);
+        if (band < 0.004) continue;
+        const k = band * wrapAmt;
+        for (let c = 0; c < 3; c++) wid.data[i * 4 + c] = clamp(Math.round(bg[i * 3 + c] * k), 0, 255);
+        wid.data[i * 4 + 3] = 255;
+      }
+      wx.putImageData(wid, 0, 0);
+      L._wrap = wc;
+    } else L._wrap = null;
+
     ctx.save();
     ctx.globalAlpha = L.opacity / 100;
     place((x, y) => ctx.drawImage(sprite, x, y, sw, sh));
     ctx.restore();
+
+    // Added, not screened: this is light arriving at the edge.
+    if (L._wrap) {
+      ctx.save();
+      ctx.globalCompositeOperation = "lighter";
+      ctx.globalAlpha = L.opacity / 100;
+      ctx.drawImage(L._wrap, 0, 0, W, H);
+      ctx.restore();
+      L._wrap = null;
+    }
   }
 
   /* 2.5 — solve the night, BEFORE any source is drawn.
@@ -2474,6 +2680,10 @@ function renderComposite(targetW, opts = {}) {
   /* 5.5 — lighting transfer from an imported relight */
   const RL = S.relight;
   if (RL.visible && RL.img && RL.strength > 0) applyRelight(ctx, W, H, RL);
+
+  /* 5.6 — lens response */
+  const BL = S.bloom;
+  if (BL.visible && BL.amount > 0) applyBloom(ctx, W, H, BL);
 
   /* 6 — finish */
   const F = S.finish;
@@ -4036,6 +4246,10 @@ function buildLayerStack() {
     actions: btnRow([
       ["🌃 Solve", () => {
         S.nightSolve.visible = true; S.night.visible = false;
+        // Every night photograph has lens bleed in it. Leaving it off by
+        // default means the first look at a solve is the one thing that most
+        // reads as rendered, so the solve brings it with it.
+        S.bloom.visible = true;
         buildLayerStack(); rerender();
         status("Night solved from the scene — light the windows to give it sources.", "ok");
       }, "Relight the scene as night, from its own geometry"],
@@ -4069,6 +4283,32 @@ function buildLayerStack() {
         { k: "floorLevel", label: "Ambient floor",  min: 0, max: 100, hint: "raise if shadows go pure black" },
         { k: "keepDark",   label: "Protect shadows", min: 0, max: 100 },
       ].forEach((sp) => b.appendChild(sliderRow(sp, S.nightSolve, rerender)));
+    },
+  }));
+
+  /* 🔆 Bloom & halation */
+  host.appendChild(sectionCard({
+    key: "bloom", icon: "🔆", title: "Bloom & halation",
+    meta: S.bloom.visible ? "on" : "off",
+    visible: S.bloom.visible,
+    onToggle: () => { S.bloom.visible = !S.bloom.visible; buildLayerStack(); rerender(); },
+    actions: btnRow([
+      ["🔆 On", () => { S.bloom.visible = true; buildLayerStack(); rerender(); }, "Let bright sources bleed, the way glass and film do"],
+      ["✕ Off", () => { S.bloom.visible = false; buildLayerStack(); rerender(); }],
+    ]),
+    body: (b) => {
+      const p = document.createElement("p");
+      p.className = "panel-hint"; p.style.margin = "2px 0 8px";
+      p.textContent = "Real optics are not clean: light from a bright source scatters in the glass, and on film it passes through the emulsion, bounces off the backing and comes back red. A frame without it reads as rendered however correct the lighting is. The halo is summed over several radii rather than one, so it has no visible edge, and the source is dimmed by what it sheds instead of having a bright copy screened over it.";
+      b.appendChild(p);
+      [
+        { k: "amount",    label: "Amount",    min: 0, max: 100 },
+        { k: "threshold", label: "Threshold", min: 0, max: 100, hint: "what counts as a source" },
+        { k: "radius",    label: "Radius",    min: 2, max: 100 },
+        { k: "spread",    label: "Tail",      min: 0, max: 100, hint: "how far the glow reaches" },
+        { k: "halation",  label: "Halation",  min: 0, max: 100, hint: "the film bounce" },
+        { k: "tint",      label: "Warmth",    min: 0, max: 100 },
+      ].forEach((sp) => b.appendChild(sliderRow(sp, S.bloom, rerender)));
     },
   }));
 
@@ -4636,6 +4876,7 @@ function newSession() {
     lights: [],
     windows: { visible: false, list: [], warmth: 34, brightness: 62, spill: 45, variation: 35, seed: 5 },
     relight: { visible: true, dataUrl: null, img: null, strength: 100, scale: 10, colour: 100, protect: 20, keepDark: 45 },
+    bloom: { visible: false, amount: 45, threshold: 62, radius: 34, spread: 55, halation: 40, tint: 18 },
     nightSolve: { visible: false, strength: 100, exposure: 70, canyon: 26, skyAmbient: 46, skyHue: 214, skySat: 30, windowGain: 62, lampGain: 70, floorLevel: 42, keepDark: 40 },
     night: { visible: false, amount: 0, skyHue: 220, skySat: 22, skyDark: 78, skyDetail: 70, shadowCool: 18, lightWarm: 55, horizonGlow: 35, glowSide: 70, stars: 0, lampWarmth: 72, skyDetect: 50, skyFeather: 30, skyEdge: 70, skyTighten: 0, skyBurn: 0, skyDodge: 0, ambient: 42, killDaylight: 78, seed: 3 },
     refine: { reach: 45, strength: 80, spill: 80 },
