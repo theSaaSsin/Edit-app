@@ -113,6 +113,31 @@ It works in **ratio, not difference** — multiplying is what a light source doe
 
 **Coarseness** is the one knob that matters, defaulted to 10 off a measured sweep rather than taste: invented detail is flat from there upward while light accuracy halves by 40. Raise it only if any of the relight's invented detail starts showing through. **Take colour** at 0 keeps its brightness and discards its white balance.
 
+## Techniques borrowed from retouchers
+
+Two things that separate a composite that reads as *photographed* from one that reads as *rendered*. Both are standard practice; both were missing.
+
+### Light wrap
+
+In a photograph the scene's light bends around a silhouette and spills onto the edge of whatever stands in front of it. A cut-out has a hard boundary where that spill should be, and the eye catches the absence instantly — even when exposure and colour match perfectly. (*Darken edge* is the opposite treatment; it kills fringing, it doesn't integrate.)
+
+Two departures from the manual version:
+
+- It's computed in **screen space**, so it survives rotation and flip without a second transform to get wrong.
+- It samples the composite **as it stands at that point in the render** — night solve and every light already on it. So the wrap carries the *actual* illumination behind the subject rather than a guess from the untouched plate. Stand someone in front of a lit window and that window's warmth lands on their edge, with no colour picked by hand.
+
+The band is `A − blur(A)`, which is exactly zero wherever both terms are 1 and negative outside the silhouette — so it can't creep into a face or spill onto the background, and thin hair (where the blur never saturates) correctly gets a strong band. Reach is a fraction of the **subject**, not the frame.
+
+### Bloom & halation
+
+Real optics aren't clean. Light from a bright source scatters in the glass, and on film it passes through the emulsion, reflects off the backing and comes back **red** — the longer wavelengths penetrate furthest before they bounce. A frame without it reads as rendered however correct the lighting is, which is why the Solve button turns it on.
+
+The halo is summed over **four blur radii in geometric steps**, not one: a single radius gives a ring you can see the edge of, and real scattering has no characteristic size.
+
+Energy is **conserved by construction** — the extracted highlight term is subtracted and its blur added back, so light *leaves* the sources and *arrives* around them instead of a bright copy being screened on top. Measured: 99th percentile 159.1 → 132.1, mean 50.75 → 50.53, blacks unmoved.
+
+> Both were wrong first, in the same instructive way: the obvious formulation of each is subtly non-conservative. Scaling bloom's loss by a constant made large bright regions *brighten* (p99 climbed to 162.5). `A × (1 − blur(A))` for the wrap band only vanishes where the blur saturates, so a subject narrower than the radius got lit all over — an 11% lift in its deep interior.
+
 ## Real night
 
 🌙 **Night** converts a daytime photograph to night rather than dropping a blue grade over it — the sky has to actually become sky at night.
