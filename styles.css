@@ -102,16 +102,15 @@ body {
 .preview-wrap { position: relative; max-width: 100%; max-height: 100%; display: flex; align-items: center; justify-content: center; }
 .preview-img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 8px; box-shadow: var(--shadow); display: block; }
 
-/* Layer overlay (scene compositing) */
+/* Layer overlay — transparent hit-boxes + handles over the composite canvas.
+   All pixels are drawn by the canvas renderer, so these boxes carry no image. */
 .layer-overlay { position: absolute; left: 0; top: 0; pointer-events: none; }
 .layer {
   position: absolute; transform: translate(-50%, -50%) rotate(var(--rot, 0deg));
   pointer-events: auto; cursor: grab; touch-action: none;
-  will-change: left, top, width, transform;
+  will-change: left, top, width, height, transform;
 }
-.layer img { display: block; width: 100%; height: auto; pointer-events: none; -webkit-user-drag: none; user-select: none; }
-.layer-overlay.with-shadow .layer img { filter: drop-shadow(var(--sx, 4px) var(--sy, 7px) 7px rgba(0,0,0,.5)); }
-.layer.selected { outline: 2px solid var(--accent); outline-offset: 1px; }
+.layer.selected { outline: 1.5px dashed rgba(240,138,75,.9); outline-offset: 1px; background: rgba(217,116,59,.06); }
 .layer .handle {
   position: absolute; width: 22px; height: 22px; border-radius: 50%;
   background: var(--accent); border: 2px solid #1a0f08; color: #1a0f08;
@@ -253,6 +252,84 @@ body {
 .toast { position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%); background: var(--bg-elev-2); border: 1px solid var(--border); color: var(--text); padding: 11px 18px; border-radius: 10px; font-size: 13.5px; box-shadow: var(--shadow); z-index: 60; max-width: 90vw; text-align: center; }
 .toast.err { background: #3a1e1e; border-color: #6b2f2f; color: #ffd9d0; }
 
+/* ============================================================
+   Layer stack panel
+   ============================================================ */
+.layer-stack { display: flex; flex-direction: column; gap: 7px; margin: 4px 0 16px; }
+
+.lcard {
+  border: 1px solid var(--border); border-radius: 11px; background: var(--bg-elev-2);
+  overflow: hidden; transition: border-color .15s, opacity .15s;
+}
+.lcard.selected { border-color: var(--accent); }
+.lcard.off { opacity: .5; }
+.lcard-head {
+  display: flex; align-items: center; gap: 8px; padding: 9px 11px;
+  cursor: pointer; user-select: none;
+}
+.lcard-head:hover { background: #232733; }
+.lcard-eye {
+  flex: 0 0 auto; background: transparent; border: none; cursor: pointer;
+  font-size: 13px; line-height: 1; padding: 2px; border-radius: 5px; filter: grayscale(.4);
+}
+.lcard-eye:hover { filter: none; background: var(--bg-elev); }
+.lcard-title { font-size: 13.5px; font-weight: 600; color: var(--text); white-space: nowrap; }
+.lcard-meta { flex: 1 1 auto; text-align: right; font-size: 11.5px; color: var(--text-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lcard-caret { flex: 0 0 auto; font-size: 11px; color: var(--text-faint); transition: transform .15s; }
+.lcard.open .lcard-caret { transform: rotate(180deg); }
+.lcard-body { display: none; padding: 4px 11px 12px; border-top: 1px solid var(--border-soft); }
+.lcard.open .lcard-body { display: block; }
+
+/* Slider rows */
+.srow { margin: 9px 0 0; }
+.srow-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 3px; }
+.srow-label { font-size: 12px; color: var(--text-dim); }
+.srow-label em { color: var(--text-faint); font-size: 11px; font-style: normal; }
+.srow-val { font-size: 11.5px; color: var(--text-faint); font-variant-numeric: tabular-nums; }
+.srange {
+  -webkit-appearance: none; appearance: none; width: 100%; height: 3px;
+  background: var(--border); border-radius: 3px; outline: none; cursor: pointer; margin: 0;
+}
+.srange::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none; width: 15px; height: 15px; border-radius: 50%;
+  background: var(--accent); border: 2px solid var(--bg-elev-2); cursor: pointer;
+}
+.srange::-moz-range-thumb {
+  width: 15px; height: 15px; border-radius: 50%; background: var(--accent);
+  border: 2px solid var(--bg-elev-2); cursor: pointer;
+}
+.srange:hover::-webkit-slider-thumb { background: var(--accent-strong); }
+
+.sgroup {
+  font-size: 10.5px; text-transform: uppercase; letter-spacing: .7px;
+  color: var(--text-faint); margin: 15px 0 2px; padding-top: 9px;
+  border-top: 1px solid var(--border-soft);
+}
+.btn-row { display: flex; flex-wrap: wrap; gap: 5px; margin: 8px 0 2px; }
+.tool-btn.tiny { font-size: 11.5px; padding: 5px 9px; border-radius: 7px; }
+.tool-btn.active { background: var(--accent); color: #1a0f08; border-color: var(--accent); }
+.lcard-body .switch { font-size: 12.5px; font-weight: 500; margin-top: 8px; }
+.lcard-body .row { margin-top: 6px; }
+.lcard-body .mini-select { flex: 1 1 auto; }
+
+/* Brush bar */
+.brush-bar {
+  margin-top: 9px; padding: 10px 12px; border: 1px solid var(--accent);
+  background: #1b1610; border-radius: 11px;
+}
+.brush-tools { display: flex; flex-wrap: wrap; gap: 6px; }
+.brush-tools + .brush-tools { margin-top: 8px; }
+.brush-rows { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; margin: 10px 0 2px; }
+.brush-slider { display: block; font-size: 11.5px; color: var(--text-dim); }
+.brush-slider span { display: block; margin-bottom: 3px; }
+.brush-slider b { color: var(--accent-strong); font-variant-numeric: tabular-nums; }
+.brush-hint { margin: 9px 0 0; font-size: 11.5px; color: var(--text-faint); line-height: 1.45; }
+
+/* Paint surface: the overlay swallows pointer events while brushing */
+.layer-overlay.painting { pointer-events: auto; cursor: crosshair; touch-action: none; }
+.stage-canvas.brush-mode { border-color: var(--accent); }
+.stage-canvas.brush-mode .preview-img { cursor: crosshair; }
+
 /* Responsive */
 @media (max-width: 880px) {
   body { overflow: auto; }
@@ -262,3 +339,19 @@ body {
   .library { max-height: 160px; }
   .stage-canvas { min-height: 220px; }
 }
+
+/* Model picker chips */
+.chip em { font-style: normal; color: var(--text-faint); font-size: 11px; }
+.chip.active em { color: var(--accent); }
+
+/* Draggable light handles on the stage */
+.light-handle {
+  position: absolute; transform: translate(-50%, -50%);
+  width: 34px; height: 34px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 17px; cursor: grab; pointer-events: auto; touch-action: none;
+  background: radial-gradient(circle, rgba(255,214,140,.95) 0%, rgba(255,170,60,.35) 55%, rgba(255,170,60,0) 100%);
+  text-shadow: 0 0 6px rgba(0,0,0,.7);
+}
+.light-handle.selected { outline: 2px solid #fff; outline-offset: 2px; }
+.light-handle:active { cursor: grabbing; }
