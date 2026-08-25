@@ -3023,7 +3023,8 @@ function sceneRectFor(L, W, H) {
    from under the subject. */
 function baseAnalysis() {
   const S = state.scene;
-  const sig = S.base.token + "|" + JSON.stringify(S.base.adj) + "|" + JSON.stringify(S.night);
+  const sig = S.base.token + "|" + JSON.stringify(S.base.adj) + "|" + JSON.stringify(S.night)
+    + "|" + JSON.stringify(S.nightSolve) + "|" + S.windows.list.length + "|" + S.lights.length;
   if (S._an && S._an.sig === sig) return S._an;
   const W = 640, H = Math.max(1, Math.round(W * (S.base.img.naturalHeight / S.base.img.naturalWidth)));
   const c = cvOf(W, H);
@@ -3034,7 +3035,20 @@ function baseAnalysis() {
   // Night moves the scene as surely as the grade does, so a subject that
   // follows the scene has to be matched against the night version of it.
   if (S.night.visible && S.night.amount > 0) applyNight(id, W, H, skyDataAt(W, H), S.night);
-  S._an = { sig, W, H, data: id.data };
+  x.putImageData(id, 0, 0);
+  /* The solved night moves the scene further than anything else in the app —
+     several stops down, with the colour redistributed around the sources — so
+     leaving it out of the target means matching a subject to a daylight scene
+     and then rendering it into a night one. It came out as +35 exposure and
+     +35 saturation on a figure standing in an unlit street: lit like noon,
+     pasted onto midnight. This is the same rule the grade and the slider
+     night already follow, applied to the term that breaks it hardest. */
+  if (S.nightSolve.visible && S.nightSolve.strength > 0) {
+    const f = solveNightField(x, W, H, S.nightSolve);
+    applyLightField(x, W, H, f.ratio, f.w, f.h,
+      { strength: S.nightSolve.strength, keepDark: S.nightSolve.keepDark });
+  }
+  S._an = { sig, W, H, data: x.getImageData(0, 0, W, H).data };
   return S._an;
 }
 
