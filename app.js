@@ -22,7 +22,7 @@ const newAdj = () => ({
   exposure: 0, contrast: 0, highlights: 0, shadows: 0,
   saturation: 0, temperature: 0, tint: 0, blur: 0, grain: 0,
 });
-const newMatte = () => ({ choke: 0, feather: 0, edgeDark: 0, burn: 0, dodge: 0, wrap: 0, wrapDist: 32 });
+const newMatte = () => ({ choke: 0, feather: 0, edgeDark: 0, burn: 0, dodge: 0, wrap: 0, wrapDist: 32, shade: 0, round: 55, fill: 35 });
 const newShadow = () => ({ on: true, angle: 135, length: 26, soft: 40, opacity: 45, contact: 55 });
 
 /* Slider specs — the panel UI is generated from these */
@@ -43,6 +43,9 @@ const MATTE_ROWS = [
   { k: "edgeDark", label: "Darken edge", min: 0, max: 100, hint: "kills bright fringing" },
   { k: "wrap",     label: "Light wrap",  min: 0, max: 100, hint: "the scene's light spills onto the edge" },
   { k: "wrapDist", label: "Wrap depth",  min: 4, max: 100, hint: "how far in it reaches" },
+  { k: "shade",    label: "Light shaping", min: 0, max: 100, hint: "placed lights model the subject by side" },
+  { k: "round",    label: "Roundness",   min: 0, max: 100, hint: "flat cut-out to cylindrical" },
+  { k: "fill",     label: "Shadow fill", min: 0, max: 100, hint: "keeps the dark side off pure black" },
 ];
 const SHADOW_ROWS = [
   { k: "angle",   label: "Light from", min: 0, max: 359, unit: "°" },
@@ -1552,7 +1555,87 @@ function shadowMapFor(occ, w, h, lxf, lyf, softness, depth, depthGap) {
   return vis;
 }
 
-function applyLights(id, W, H, lights, unit, skyData) {
+/* ---------------------------------------------------------------------------
+   Surface orientation for a cut-out.
+
+   A sprite has no idea which way it faces, which is why a placed light could
+   only ever make a subject uniformly brighter or uniformly darker. Direction
+   is the whole difference between a figure that is lit and a figure that has
+   had its exposure raised — no slider fixes it, because the information isn't
+   in a flat cut-out at all.
+
+   It can be inferred, though, and the standard compositing trick is to take
+   it from the matte. Blur the alpha and its gradient points inward across the
+   silhouette, so the negated gradient is the direction the edge faces. Deep
+   inside the subject the blurred alpha is flat, the gradient vanishes, and
+   the normal stands up towards the camera. That is exactly the behaviour of a
+   roughly cylindrical object — a torso, an arm, a lamp post — and a person is
+   mostly made of those.
+
+   It is not geometry and does not pretend to be: it cannot know a nose from a
+   cheek. What it gets right is the thing that reads at a glance, which is that
+   the side of someone facing a street lamp is bright and the other side is not.
+--------------------------------------------------------------------------- */
+function normalsFromAlpha(alpha, w, h, roundness) {
+  const nx = new Float32Array(w * h), ny = new Float32Array(w * h), nz = new Float32Array(w * h);
+  /* The blur radius sets how far from the silhouette the surface is treated
+     as turning away, so it has to be comparable to the body's HALF-WIDTH, not
+     to a thin rim. At a tenth of the width the normal bent only in a narrow
+     band at the edges and the whole torso stayed flat-on to the camera —
+     measured as a 3% difference between a figure's lit and unlit sides, which
+     is no difference at all. A limb is a cylinder across its full width.
+
+     Blurring wider also flattens the gradient in proportion to the radius, so
+     the slope is scaled back up by it; otherwise widening the band would
+     quietly weaken the very effect it is meant to strengthen. */
+  const blur = Float32Array.from(alpha);
+  const r = Math.max(2, Math.round(w * (roundness / 100) * 0.55));
+  boxBlur(blur, w, h, r, 1);
+  boxBlur(blur, w, h, Math.max(1, r >> 1), 1);
+  const k = r * 1.35;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      const xm = x > 0 ? i - 1 : i, xp = x < w - 1 ? i + 1 : i;
+      const ym = y > 0 ? i - w : i, yp = y < h - 1 ? i + w : i;
+      // negated gradient: outward from the body
+      let gx = -(blur[xp] - blur[xm]) * 0.5 * k;
+      let gy = -(blur[yp] - blur[ym]) * 0.5 * k;
+      const len = Math.hypot(gx, gy);
+      if (len > 1) { gx /= len; gy /= len; }
+      nx[i] = gx; ny[i] = gy;
+      nz[i] = Math.sqrt(Math.max(0.04, 1 - Math.min(1, gx * gx + gy * gy)));
+    }
+  }
+  return { nx, ny, nz };
+}
+
+/* The scene-space buffer the lights read. Normals are packed into a canvas so
+   the existing draw transform places them: a rotated or flipped sprite gets
+   its normals rotated with it for free, which is the whole reason this is
+   built during the draw rather than afterwards from the flattened frame. */
+function packNormals(sprite, sw, sh, roundness, fill) {
+  const w = Math.max(8, Math.min(320, Math.round(sw))), h = Math.max(8, Math.round(w * sh / sw));
+  const c = cvOf(w, h), cx = c.getContext("2d");
+  cx.drawImage(sprite, 0, 0, w, h);
+  const d = cx.getImageData(0, 0, w, h);
+  const a = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) a[i] = d.data[i * 4 + 3] / 255;
+  const { nx, ny, nz } = normalsFromAlpha(a, w, h, roundness);
+  for (let i = 0; i < w * h; i++) {
+    d.data[i * 4] = clamp(Math.round((nx[i] * 0.5 + 0.5) * 255), 0, 255);
+    d.data[i * 4 + 1] = clamp(Math.round((ny[i] * 0.5 + 0.5) * 255), 0, 255);
+    d.data[i * 4 + 2] = clamp(Math.round(nz[i] * 255), 0, 255);
+    // alpha carries coverage, so a soft matte shades softly rather than
+    // stamping a hard-edged lit shape over a feathered one
+    d.data[i * 4 + 3] = Math.round(a[i] * 255);
+  }
+  cx.putImageData(d, 0, 0);
+  c._fill = fill;
+  return c;
+}
+
+function applyLights(id, W, H, lights, unit, skyData, nrmBuf) {
   const live = lights.filter((l) => l.visible && l.intensity > 0);
   if (!live.length) return id;
   const d = id.data;
@@ -1583,18 +1666,49 @@ function applyLights(id, W, H, lights, unit, skyData) {
         ? shadowMapFor(occ, sw2, sh2, l.x, l.y, l.shadowSoft ?? 45, dep, ((l.depthGap ?? 22) / 100))
         : null,
       shAmt: (l.shadows ?? 100) / 100,
+      fill: clamp((l.shadeFill ?? 35) / 100, 0, 1),
     };
   });
+
+  /* Surface orientation, if any subject supplied it. A light is placed in the
+     picture plane but sits a little in front of it — a lamp is never exactly
+     edge-on to what it lights — so the direction to it has a z component, and
+     without one every normal facing the camera would receive nothing. */
+  let NB = null, nw = 0, nh = 0;
+  if (nrmBuf) {
+    nw = nrmBuf.width; nh = nrmBuf.height;
+    NB = nrmBuf.getContext("2d").getImageData(0, 0, nw, nh).data;
+  }
 
   for (let y = 0; y < H; y++) {
     for (let x = 0; x < W; x++) {
       let gr = 0, gg = 0, gb = 0, ar = 0, ag = 0, ab = 0;
+      let nX = 0, nY = 0, nZ = 0, nA = 0;
+      if (NB) {
+        const q = (Math.min(nh - 1, (y * nh / H) | 0) * nw + Math.min(nw - 1, (x * nw / W) | 0)) * 4;
+        nA = NB[q + 3] / 255;
+        if (nA > 0.004) {
+          nX = NB[q] / 127.5 - 1; nY = NB[q + 1] / 127.5 - 1; nZ = NB[q + 2] / 255;
+        }
+      }
       for (let i = 0; i < P.length; i++) {
         const p = P[i];
         const dx = x - p.cx, dy = y - p.cy;
         const dist = Math.sqrt(dx * dx + dy * dy) / p.R;
         if (dist > 3.2) continue;
         let f = 1 / (1 + Math.pow(dist, p.pow) * 4);
+        if (nA > 0.004) {
+          // direction TO the light, with the lamp standing off the plane
+          const lz = p.R * 0.55;
+          const inv = 1 / Math.max(1e-3, Math.hypot(dx, dy, lz));
+          const lam = Math.max(0, (-dx * inv) * nX + (-dy * inv) * nY + (lz * inv) * nZ);
+          /* A fill term keeps the dark side from going to pure black. Real
+             streets bounce light off the ground and the walls opposite, and a
+             figure with a mathematically black shadow side reads as cut from
+             paper just as badly as a flat one. */
+          const fill = p.fill;
+          f *= (1 - nA) + nA * (fill + (1 - fill) * lam);
+        }
         if (p.cone) {
           // A headlight is a cone: fall off toward the edge of the beam
           // rather than cutting a hard-edged wedge out of the frame.
@@ -2402,6 +2516,22 @@ function solveNightField(ctx, W, H, NS) {
   pc.getContext("2d").drawImage(ctx.canvas, 0, 0, w, h);
   const pd = pc.getContext("2d").getImageData(0, 0, w, h).data;
 
+  /* The daylight field is estimated from the SCENE, never from the composite.
+     They differ by whatever has been pasted in, and using the composite makes
+     a subject help estimate the light that is supposed to be falling on it —
+     which is circular, and fails in the specific way that matters. A figure in
+     dark clothing lowers the field where she stands, the field is divided out,
+     and she is handed back several stops brighter than she went in: a dark
+     photograph rendered as a pale ghost standing in a night street. Low
+     luminance means dark ALBEDO as often as it means dim light, and only the
+     scene's own pixels are safe to read illumination from. */
+  const bc = cvOf(w, h);
+  bc.getContext("2d").drawImage(S.base.img, 0, 0, w, h);
+  const bctx = bc.getContext("2d");
+  const bid = bctx.getImageData(0, 0, w, h);
+  applyAdjust(bid, S.base.adj);
+  const bd = bid.data;
+
   /* 1 — the daylight field currently in the picture. Low-frequency luminance
      conflates illumination with albedo, but albedo is broadband and roughly
      uncorrelated with position, so over a large blur it averages out and what
@@ -2409,7 +2539,7 @@ function solveNightField(ctx, W, H, NS) {
      a multiplicative quantity. */
   const day = new Float32Array(n);
   for (let i = 0; i < n; i++) {
-    day[i] = Math.log2(0.2126 * pd[i * 4] + 0.7152 * pd[i * 4 + 1] + 0.0722 * pd[i * 4 + 2] + 8);
+    day[i] = Math.log2(0.2126 * bd[i * 4] + 0.7152 * bd[i * 4 + 1] + 0.0722 * bd[i * 4 + 2] + 8);
   }
   const rD = Math.max(3, Math.round(Math.min(w, h) * 0.13));
   boxBlur(day, w, h, rD, 1); boxBlur(day, w, h, rD >> 1, 1);
@@ -2586,6 +2716,13 @@ function renderComposite(targetW, opts = {}) {
   }
 
   /* 2 — subject cutouts */
+  /* Orientation buffer for the lights. Normals are drawn through the same
+     transform as the sprite, so rotation and flip come along automatically. */
+  let nrm = null, nrmCtx = null;
+  if (sortedLayers().some((L) => L.visible && (L.matte.shade || 0) > 0)) {
+    nrm = cvOf(Math.max(64, Math.round(W / 3)), Math.max(64, Math.round(H / 3)));
+    nrmCtx = nrm.getContext("2d");
+  }
   for (const L of sortedLayers()) {
     if (!L.visible) continue;
     const w = Math.max(2, L.fw * W);
@@ -2659,16 +2796,30 @@ function renderComposite(targetW, opts = {}) {
        colour to pick by hand. */
     const wrapAmt = (L.matte.wrap || 0) / 100;
     if (wrapAmt > 0) {
-      const rw = Math.max(24, Math.round(W * 0.32));
-      const rh = Math.max(24, Math.round(rw * H / W));
-      const bgc = cvOf(rw, rh);
-      bgc.getContext("2d").drawImage(ctx.canvas, 0, 0, rw, rh);
+      /* Solved around the subject, at the subject's own scale — not at a
+         fixed fraction of the frame. Sized to the frame, a figure occupying a
+         small part of the shot landed on about 25 pixels, which is thinner
+         than the blur radius through an arm or a hank of hair; blur(A) never
+         reached 1 there, so the band never reached 0 and the wrap laid a veil
+         of background across her whole body instead of a rim on her edge.
+         A wrap is a local effect and belongs in a local buffer. */
+      const halfDiag = 0.5 * Math.hypot(sw, sh);
+      const pad = Math.max(10, sw * 0.4);
+      const rx0 = clamp(Math.floor(cx - halfDiag - pad), 0, W - 2);
+      const ry0 = clamp(Math.floor(cy - halfDiag - pad), 0, H - 2);
+      const rx1 = clamp(Math.ceil(cx + halfDiag + pad), rx0 + 2, W);
+      const ry1 = clamp(Math.ceil(cy + halfDiag + pad), ry0 + 2, H);
+      const rw0 = rx1 - rx0, rh0 = ry1 - ry0;
+      const k = clamp(260 / Math.max(8, sw), 0.12, 1.6);
+      const rw = Math.max(16, Math.round(rw0 * k)), rh = Math.max(16, Math.round(rh0 * k));
+      const kx = rw / rw0, ky = rh / rh0;
 
-      // the subject's alpha, in screen space, at the same reduced size
+      const bgc = cvOf(rw, rh);
+      bgc.getContext("2d").drawImage(ctx.canvas, rx0, ry0, rw0, rh0, 0, 0, rw, rh);
+
       const alc = cvOf(rw, rh), ax = alc.getContext("2d");
-      const kx = rw / W, ky = rh / H;
       ax.save();
-      ax.translate(cx * kx, cy * ky);
+      ax.translate((cx - rx0) * kx, (cy - ry0) * ky);
       ax.rotate(rad);
       if (L.flipH) ax.scale(-1, 1);
       ax.drawImage(sprite, (-sw / 2) * kx, (-sh / 2) * ky, sw * kx, sh * ky);
@@ -2685,8 +2836,8 @@ function renderComposite(targetW, opts = {}) {
          the shot and swallowed a small one whole — on a figure narrower than
          the blur radius the band never vanishes and the wrap lights the whole
          body. Measured as an 11% lift in the deep interior before this. */
-      const subW = Math.max(4, sw * kx);
-      const r = clamp(Math.round(((L.matte.wrapDist || 32) / 100) * subW * 0.35), 1, Math.round(Math.min(rw, rh) * 0.12));
+      const subW = Math.max(8, sw * kx);
+      const r = clamp(Math.round(((L.matte.wrapDist || 32) / 100) * subW * 0.30), 1, 64);
       boxBlur(Ab, rw, rh, r, 1); boxBlur(Ab, rw, rh, Math.max(1, r >> 1), 1);
       const bg = new Float32Array(nn * 3);
       for (let i = 0; i < nn; i++) for (let c = 0; c < 3; c++) bg[i * 3 + c] = bd[i * 4 + c];
@@ -2714,7 +2865,7 @@ function renderComposite(targetW, opts = {}) {
         wid.data[i * 4 + 3] = 255;
       }
       wx.putImageData(wid, 0, 0);
-      L._wrap = wc;
+      L._wrap = { cv: wc, x: rx0, y: ry0, w: rw0, h: rh0 };
     } else L._wrap = null;
 
     ctx.save();
@@ -2722,12 +2873,24 @@ function renderComposite(targetW, opts = {}) {
     place((x, y) => ctx.drawImage(sprite, x, y, sw, sh));
     ctx.restore();
 
+    if (nrmCtx && (L.matte.shade || 0) > 0) {
+      const nb = packNormals(sprite, sprite.width, sprite.height, L.matte.round ?? 55, (L.matte.fill ?? 35) / 100);
+      const kx = nrm.width / W, ky = nrm.height / H;
+      nrmCtx.save();
+      nrmCtx.translate(cx * kx, cy * ky);
+      nrmCtx.rotate(rad);
+      if (L.flipH) nrmCtx.scale(-1, 1);
+      nrmCtx.globalAlpha = clamp((L.matte.shade || 0) / 100, 0, 1);
+      nrmCtx.drawImage(nb, (-sw / 2) * kx, (-sh / 2) * ky, sw * kx, sh * ky);
+      nrmCtx.restore();
+    }
+
     // Added, not screened: this is light arriving at the edge.
     if (L._wrap) {
       ctx.save();
       ctx.globalCompositeOperation = "lighter";
       ctx.globalAlpha = L.opacity / 100;
-      ctx.drawImage(L._wrap, 0, 0, W, H);
+      ctx.drawImage(L._wrap.cv, L._wrap.x, L._wrap.y, L._wrap.w, L._wrap.h);
       ctx.restore();
       L._wrap = null;
     }
@@ -2786,7 +2949,7 @@ function renderComposite(targetW, opts = {}) {
   /* 3 — placeable lights, after the subjects so they light them too */
   if (S.lights.length) {
     const lid = ctx.getImageData(0, 0, W, H);
-    applyLights(lid, W, H, S.lights, unit, S.night.visible && S.night.amount > 0 ? skyDataAt(W, H) : null);
+    applyLights(lid, W, H, S.lights, unit, S.night.visible && S.night.amount > 0 ? skyDataAt(W, H) : null, nrm);
     ctx.putImageData(lid, 0, 0);
   }
 
