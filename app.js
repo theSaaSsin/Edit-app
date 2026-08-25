@@ -600,6 +600,231 @@ function boxBlur(buf, w, h, r, ch) {
 }
 
 /* Returns { mask, decon } canvases at working resolution. */
+/* ---------------------------------------------------------------------------
+   Closed-form matting (Levin, Lischinski & Weiss 2007).
+
+   This replaces guesswork with the published solution to the problem. The
+   previous refine estimated a local foreground and background colour and asked
+   where each pixel sat on the line between them — which is the right intuition
+   and a crude version of this, because it decides every pixel independently
+   and has nothing to say when the estimate is poor.
+
+   Closed-form matting makes the same local colour-line assumption but solves
+   for the WHOLE matte at once. Alpha is assumed locally linear in colour over
+   each 3x3 window; eliminating the unknown foreground and background analytically
+   leaves a quadratic in alpha alone, whose minimiser is the solution of a
+   sparse linear system. Every window a pixel belongs to gets a vote, and
+   neighbouring windows overlap, so information propagates along a hair strand
+   instead of stopping at whichever pixel was ambiguous.
+
+   Formulation and constants follow the PyMatting reference implementation
+   (cf_laplacian / make_linear_system): 3x3 windows, epsilon 1e-7 on a 0..1
+   colour scale, constraints applied as A = L + lambda*C with lambda 100 and
+   b = lambda for known foreground, then solved with conjugate gradients.
+
+   Two things make it affordable in a browser. The Laplacian is only built for
+   windows that contain an unknown pixel — a window that is entirely decided
+   contributes nothing that can change the answer — and the solve is restricted
+   to that band, which on a cut-out portrait is a small share of the frame.
+   Because r = 1, a row can only reach two pixels in each direction, so the
+   matrix is a dense 5x5 stencil per active pixel rather than a general sparse
+   structure, and the whole thing stays in flat typed arrays.
+--------------------------------------------------------------------------- */
+function dilateMask(src, w, h, r) {
+  if (r <= 0) return Uint8Array.from(src);
+  const tmp = new Uint8Array(w * h), out = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let v = 0;
+      for (let d = -r; d <= r && !v; d++) {
+        const xx = x + d;
+        if (xx >= 0 && xx < w && src[y * w + xx]) v = 1;
+      }
+      tmp[y * w + x] = v;
+    }
+  }
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let v = 0;
+      for (let d = -r; d <= r && !v; d++) {
+        const yy = y + d;
+        if (yy >= 0 && yy < h && tmp[yy * w + x]) v = 1;
+      }
+      out[y * w + x] = v;
+    }
+  }
+  return out;
+}
+
+function closedFormMatte(srcImg, maskSrc, opts = {}) {
+  const { reach = 45, iterations = 240, epsilon = 1e-7, lambda = 100, maxDim = 760 } = opts;
+
+  const w0 = srcImg.naturalWidth || srcImg.width, h0 = srcImg.naturalHeight || srcImg.height;
+  const sc = Math.min(1, maxDim / Math.max(w0, h0));
+  const W = Math.max(8, Math.round(w0 * sc)), H = Math.max(8, Math.round(h0 * sc));
+  const N = W * H;
+
+  const ic = cvOf(W, H); ic.getContext("2d").drawImage(srcImg, 0, 0, W, H);
+  const ID = ic.getContext("2d").getImageData(0, 0, W, H).data;
+  const mc = cvOf(W, H); mc.getContext("2d").drawImage(maskSrc, 0, 0, W, H);
+  const MD = mc.getContext("2d").getImageData(0, 0, W, H).data;
+
+  const I = new Float32Array(N * 3), a0 = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    I[i * 3] = ID[i * 4] / 255; I[i * 3 + 1] = ID[i * 4 + 1] / 255; I[i * 3 + 2] = ID[i * 4 + 2] / 255;
+    a0[i] = MD[i * 4] / 255;
+  }
+
+  /* The trimap. Anything not already decisively in or out is unknown, and that
+     region is then widened — which is the whole point. A matte with a thin
+     soft edge has no ROOM to grow a hair strand; opening the band gives the
+     solver somewhere to put one. This is what "reach" controls. */
+  const seed = new Uint8Array(N);
+  for (let i = 0; i < N; i++) seed[i] = (a0[i] > 0.04 && a0[i] < 0.96) ? 1 : 0;
+  /* The band has to be wide enough to CONTAIN the strands. On the test
+     portrait the flyaway hair reaches 20-40px beyond where background removal
+     cut it, and a 5px band gave the solver nowhere to put any of it — which
+     is why both this and the older refine returned a slightly softer version
+     of the same silhouette instead of hair. */
+  const band = Math.max(3, Math.round((reach / 100) * Math.min(W, H) * 0.16));
+  const unknown = dilateMask(seed, W, H, band);
+  let unknownN = 0;
+  for (let i = 0; i < N; i++) if (unknown[i]) unknownN++;
+  if (!unknownN) return null;
+
+  // Rows are only needed where a window containing an unknown pixel can reach.
+  const active = dilateMask(unknown, W, H, 4);
+  const idx = new Int32Array(N).fill(-1);
+  let M = 0;
+  for (let i = 0; i < N; i++) if (active[i]) idx[i] = M++;
+
+  const St = new Float32Array(M * 25);          // 5x5 stencil per active row
+  const c = new Float32Array(M), b = new Float32Array(M), x = new Float32Array(M);
+  for (let i = 0; i < N; i++) {
+    const p = idx[i];
+    if (p < 0) continue;
+    x[p] = clamp(a0[i], 0, 1);
+    if (!unknown[i]) { c[p] = lambda; b[p] = a0[i] >= 0.5 ? lambda : 0; }
+  }
+
+  const win = new Float32Array(9 * 3);
+  for (let y = 1; y < H - 1; y++) {
+    for (let xw = 1; xw < W - 1; xw++) {
+      // skip windows with nothing undecided in them
+      let any = 0;
+      for (let dy = -1; dy <= 1 && !any; dy++) {
+        for (let dx = -1; dx <= 1; dx++) if (unknown[(y + dy) * W + (xw + dx)]) { any = 1; break; }
+      }
+      if (!any) continue;
+
+      let m0 = 0, m1 = 0, m2 = 0;
+      for (let dy = -1, k = 0; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++, k++) {
+          const q = ((y + dy) * W + (xw + dx)) * 3;
+          win[k * 3] = I[q]; win[k * 3 + 1] = I[q + 1]; win[k * 3 + 2] = I[q + 2];
+          m0 += I[q]; m1 += I[q + 1]; m2 += I[q + 2];
+        }
+      }
+      m0 /= 9; m1 /= 9; m2 /= 9;
+      for (let k = 0; k < 9; k++) { win[k * 3] -= m0; win[k * 3 + 1] -= m1; win[k * 3 + 2] -= m2; }
+
+      let a00 = epsilon, a01 = 0, a02 = 0, a11 = epsilon, a12 = 0, a22 = epsilon;
+      for (let k = 0; k < 9; k++) {
+        const s = win[k * 3], t = win[k * 3 + 1], u = win[k * 3 + 2];
+        a00 += s * s; a01 += s * t; a02 += s * u; a11 += t * t; a12 += t * u; a22 += u * u;
+      }
+      a00 /= 9; a01 /= 9; a02 /= 9; a11 /= 9; a12 /= 9; a22 /= 9;
+
+      const det = a00 * a12 * a12 + a01 * a01 * a22 + a02 * a02 * a11
+        - a00 * a11 * a22 - 2 * a01 * a02 * a12;
+      if (!det || !isFinite(det)) continue;
+      const inv = 1 / det;
+      const n00 = (a12 * a12 - a11 * a22) * inv, n01 = (a01 * a22 - a02 * a12) * inv;
+      const n02 = (a02 * a11 - a01 * a12) * inv, n11 = (a02 * a02 - a00 * a22) * inv;
+      const n12 = (a00 * a12 - a01 * a02) * inv, n22 = (a01 * a01 - a00 * a11) * inv;
+
+      for (let ki = 0; ki < 9; ki++) {
+        const yi = y + ((ki / 3) | 0) - 1, xi = xw + (ki % 3) - 1;
+        const pi = idx[yi * W + xi];
+        if (pi < 0) continue;
+        const s = win[ki * 3], t = win[ki * 3 + 1], u = win[ki * 3 + 2];
+        const c0 = n00 * s + n01 * t + n02 * u;
+        const c1 = n01 * s + n11 * t + n12 * u;
+        const c2 = n02 * s + n12 * t + n22 * u;
+        for (let kj = 0; kj < 9; kj++) {
+          const yj = y + ((kj / 3) | 0) - 1, xj = xw + (kj % 3) - 1;
+          const temp = c0 * win[kj * 3] + c1 * win[kj * 3 + 1] + c2 * win[kj * 3 + 2];
+          const v = (ki === kj ? 1 : 0) - (1 + temp) / 9;
+          const sy = yj - yi + 2, sx = xj - xi + 2;
+          St[pi * 25 + sy * 5 + sx] += v;
+        }
+      }
+    }
+  }
+
+  // A x, with A = L + lambda*C
+  const rowOf = new Int32Array(M);
+  for (let i = 0; i < N; i++) if (idx[i] >= 0) rowOf[idx[i]] = i;
+  const matvec = (v, out) => {
+    for (let p = 0; p < M; p++) {
+      const i = rowOf[p], px = i % W, py = (i / W) | 0;
+      let s = c[p] * v[p];
+      const base = p * 25;
+      for (let sy = 0; sy < 5; sy++) {
+        const yy = py + sy - 2;
+        if (yy < 0 || yy >= H) continue;
+        for (let sx = 0; sx < 5; sx++) {
+          const val = St[base + sy * 5 + sx];
+          if (val === 0) continue;
+          const xx = px + sx - 2;
+          if (xx < 0 || xx >= W) continue;
+          const q = idx[yy * W + xx];
+          if (q >= 0) s += val * v[q];
+        }
+      }
+      out[p] = s;
+    }
+  };
+
+  // Conjugate gradients with Jacobi preconditioning.
+  const diag = new Float32Array(M);
+  for (let p = 0; p < M; p++) {
+    const d = St[p * 25 + 12] + c[p];
+    diag[p] = Math.abs(d) > 1e-12 ? 1 / d : 1;
+  }
+  const r = new Float32Array(M), z = new Float32Array(M), pv = new Float32Array(M), Ap = new Float32Array(M);
+  matvec(x, Ap);
+  for (let p = 0; p < M; p++) { r[p] = b[p] - Ap[p]; z[p] = r[p] * diag[p]; pv[p] = z[p]; }
+  let rz = 0;
+  for (let p = 0; p < M; p++) rz += r[p] * z[p];
+  const rz0 = rz;
+  for (let it = 0; it < iterations && rz > rz0 * 1e-8; it++) {
+    matvec(pv, Ap);
+    let pAp = 0;
+    for (let p = 0; p < M; p++) pAp += pv[p] * Ap[p];
+    if (!pAp || !isFinite(pAp)) break;
+    const al = rz / pAp;
+    for (let p = 0; p < M; p++) { x[p] += al * pv[p]; r[p] -= al * Ap[p]; }
+    let rzNew = 0;
+    for (let p = 0; p < M; p++) { z[p] = r[p] * diag[p]; rzNew += r[p] * z[p]; }
+    const be = rzNew / rz;
+    for (let p = 0; p < M; p++) pv[p] = z[p] + be * pv[p];
+    rz = rzNew;
+  }
+
+  const out = cvOf(W, H), ox = out.getContext("2d");
+  const oid = ox.createImageData(W, H);
+  for (let i = 0; i < N; i++) {
+    const p = idx[i];
+    const a = p >= 0 && unknown[i] ? clamp(x[p], 0, 1) : a0[i];
+    const v = Math.round(a * 255);
+    oid.data[i * 4] = oid.data[i * 4 + 1] = oid.data[i * 4 + 2] = v;
+    oid.data[i * 4 + 3] = 255;
+  }
+  ox.putImageData(oid, 0, 0);
+  return { mask: out, unknownPct: (100 * unknownN) / N, active: M, W, H };
+}
+
 function refineHair(srcImg, maskSrc, { reach = 45, strength = 80, spill = 80 } = {}) {
   const maxDim = 1100;
   const w0 = srcImg.naturalWidth || srcImg.width, h0 = srcImg.naturalHeight || srcImg.height;
@@ -4029,9 +4254,16 @@ async function runRefineHair(L) {
   try {
     // Refines from the CURRENT mask, so a rough hand-brushed fix is a valid
     // input to it: block the edge in loosely, then let this solve the strands.
-    const out = refineHair(L.src, L.mask, R);
-    const m = cvOf(L.mask.width, L.mask.height);
-    m.getContext("2d").drawImage(out.mask, 0, 0, m.width, m.height);
+    /* Closed-form matting solves the alpha; the colour-line pass then runs at
+       zero strength purely for its de-spill, which closed-form does not do —
+       it returns an alpha and says nothing about un-mixing the background out
+       of the foreground colour. If the solve declines (nothing left unknown
+       to solve for) the colour-line estimate stands on its own. */
+    const cf = closedFormMatte(L.src, L.mask, { reach: R.reach });
+    const alphaSrc = cf ? cf.mask : L.mask;
+    const out = refineHair(L.src, alphaSrc, { ...R, strength: cf ? 0 : R.strength });
+    const m = cvOf(alphaSrc.width, alphaSrc.height);
+    m.getContext("2d").drawImage(cf ? cf.mask : out.mask, 0, 0, m.width, m.height);
     L.mask = m;
     L.decon = R.spill > 0 ? out.decon : null;
     L.maskRev++;
